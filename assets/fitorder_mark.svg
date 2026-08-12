@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><defs><clipPath id="ca"><rect x="0" y="0" width="512" height="512" rx="25.6"/></clipPath></defs>
+<g clip-path="url(#ca)">
+<rect x="0" y="0" width="512" height="512" fill="#1F1A17"/>
+<rect x="0" y="0" width="512" height="51.2" fill="#DD3727"/>
+</g>
+<text x="256.0" y="358.4" text-anchor="middle" font-family="DejaVu Sans" font-size="215.04" font-weight="bold" fill="#FFFFFF">Fit</text></svg>

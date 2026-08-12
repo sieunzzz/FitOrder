@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="336" viewBox="0 0 1200 336"><defs><clipPath id="cw"><rect x="0" y="26.879999999999995" width="282.24" height="282.24" rx="14.112000000000002"/></clipPath></defs>
+<g clip-path="url(#cw)">
+<rect x="0" y="26.879999999999995" width="282.24" height="282.24" fill="#1F1A17"/>
+<rect x="0" y="26.879999999999995" width="282.24" height="28.224000000000004" fill="#DD3727"/>
+</g>
+<text x="141.12" y="224.44799999999998" text-anchor="middle" font-family="DejaVu Sans" font-size="118.5408" font-weight="bold" fill="#FFFFFF">Fit</text><text x="355.6224" y="221.76000000000002" font-family="DejaVu Sans" font-size="135.4752" font-weight="bold" fill="#1F1A17">Fit<tspan fill="#DD3727">Order</tspan></text></svg>
