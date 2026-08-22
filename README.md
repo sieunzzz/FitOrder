@@ -1,289 +1,260 @@
 <div align="center">
 
-<img src="assets/fitorder_mark.png" width="88" alt="FitOrder">
+<img src="assets/fitorder_mark.png" width="92" alt="FitOrder 로고">
 
 # FitOrder
 
-**비정형 발주서에서 맞춤 제작 사양을 추출해 장부 · 작업지시서 · 전표를 생성하는 자동화 시스템**
+### 블라인드 제조 공장을 위한 발주서 자동 변환 시스템
 
-[![Python](https://img.shields.io/badge/Python-3.12-blue)](https://www.python.org/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-1.40+-FF4B4B)](https://streamlit.io/)
-[![OpenAI](https://img.shields.io/badge/OpenAI-GPT--4o-412991)](https://platform.openai.com/)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+카카오톡 이미지 · PDF · 메시지 · 엑셀 발주서를 읽어  
+**장부 · 작업지시서 · 경영박사 EDI**로 변환합니다.
+
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-local_app-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
+[![OpenAI](https://img.shields.io/badge/OpenAI-Structured_Outputs-412991?logo=openai&logoColor=white)](https://platform.openai.com/)
+[![License](https://img.shields.io/badge/License-MIT-22A699)](LICENSE)
 
 </div>
 
 ---
 
-## 무엇을 해결하는가
+## FitOrder가 하는 일
 
-블라인드 제조 공장에는 하루 400건의 발주가 들어옵니다. 거래처 9곳이 각기 다른 방식으로
-보냅니다. 어떤 곳은 카카오톡으로 주문서 사진을, 어떤 곳은 채팅 메시지를, 어떤 곳은
-엑셀 파일을 보냅니다. 같은 물건을 부르는 이름도 다릅니다.
+거래처마다 다른 형식의 발주서를 담당자가 세 문서에 반복해서 옮겨 적던 업무를 자동화합니다.
 
-담당자 한 명이 이것을 읽고 **세 개의 문서에 각각 손으로 옮겨 적습니다.**
-
-| 문서 | 용도 |
-| --- | --- |
-| 장부 | 사무실 관리용. 내부 표기와 배송 정보 포함 |
-| 작업지시서 | 제작 현장 전달용. 내부 표기를 제거하고 단순화 |
-| 경영박사 전표 | ERP 등록용. 치수에서 면적과 금액을 계산 |
-
-세 문서는 같은 주문을 담지만 표기 규칙이 전부 다릅니다. 그리고 그 규칙은
-**어디에도 문서화되어 있지 않았습니다.**
-
----
-
-## 어떻게 동작하는가
+| 입력 | 처리 | 출력 |
+| :--- | :---: | :--- |
+| 카카오톡 캡처·이미지 | AI 추출 + 코드 검증 | `장부.xlsx` |
+| 다중 페이지 PDF | → | `작업지시서.xlsx` |
+| 거래처별 엑셀 | 결정적 전용 파서 | `경영박사_EDI.xls` |
+| 기존 공장 장부 `.xls` | 장부 역변환 | 작업지시서 + EDI |
 
 ```mermaid
-flowchart TD
-    A["발주서 입력<br/>카톡 캡처 · 클립보드 · 드래그 · 엑셀"]
-
-    A --> B{"파일 형식"}
-    B -->|이미지| C["LLM 추출<br/>extract.py"]
-    B -->|엑셀| D["전용 파서<br/>parsers.py"]
-
-    C --> E["표준 JSON<br/>창 1개 = 항목 1개, 필드 18개 + 확신도"]
-    D --> E
-
-    E --> F["마스터 조회 · 도메인 규칙 · 검증 15개<br/>rules.py"]
-    F --> G["담당자 검토 · 수정<br/>app.py"]
-    G -->|"수정값 역반영"| E
-
-    G --> H["문서 생성<br/>output.py"]
-    H --> I["장부.xlsx"]
-    H --> J["작업지시서.xlsx"]
-    H --> K["경영박사.xlsx"]
-
-    G -.->|출력 이력| L[("SQLite<br/>중복 · 변경 감지")]
-    L -.-> F
+flowchart LR
+    A["발주서<br/>이미지 · PDF · 엑셀"] --> B["추출·파싱"]
+    B --> C["규칙 검증"]
+    C --> D["담당자 확인·수정"]
+    D --> E["장부"]
+    D --> F["작업지시서"]
+    D --> G["경영박사 EDI"]
 ```
 
-### 같은 주문이 세 문서에서 어떻게 달라지는가
-
-```
-                 카톡 캡처 1장
-                       │
-       ┌───────────────┼───────────────┐
-       ▼               ▼               ▼
-     장부           작업지시서       경영박사
-  JO (K)             JO           B200(IV)-L18/원코드
-  B 원코드 200       원코드 200      2.59  ·  55,167  ·  5,517
-  54.5 X 116        54.5 X 116     110.0*235.0/1EA
-  좌  ·  손150       좌  ·  손150    사원코드 1
-  목(택배) ☆         목
-```
-
-- 장부는 내부 관리 표기 `(K)` 와 배송 기호 `☆` 를 유지하고, 셀 안에서 `원코드` 만 초록색
-- 작업지시서는 내부 표기와 접두사 `B` 를 제거하고 16행 단위로 시트를 나눔
-- 전표는 치수에서 면적(헤베)을 계산하고 거래처별 단가를 적용해 금액과 부가세를 산출
-
----
-
-## 설계 원칙
-
-### AI 출력을 그대로 쓰지 않는다
-
-LLM은 확률적으로 동작하므로 금액이나 치수를 그대로 신뢰할 수 없습니다.
-세 계층으로 나누어 각 계층이 잘하는 일만 맡게 했습니다.
-
-| 계층 | 역할 | 담당 |
-| --- | --- | --- |
-| 1 · 추출 | 서식이 달라도 읽는다 | LLM |
-| 2 · 검증 | 계산은 결정적으로, 이상치는 표시 | 코드 |
-| 3 · 확정 | 표시된 것만 확인하고 책임진다 | 사람 |
-
-품명 조합, 면적, 단가, 금액, 부가세는 전부 코드에서 계산합니다.
-AI는 "무엇이 적혀 있는가"만 답합니다.
-
-### 전수 검토를 요구하지 않는다
-
-초기 설계는 치수를 매번 확인해야 다음으로 넘어가는 방식이었습니다.
-하루 400건에 3초씩이면 20분이고, 그보다 나쁜 것은 **200번쯤 누르면 사람이 보지 않고
-누른다**는 점입니다. 형식만 남고 안전장치는 사라집니다.
-
-전수 확인을 없애고 검증 규칙 15개로 이상치만 추려냅니다.
-담당자는 400건 중 표시된 것만 확인합니다.
-
-### 기존 서식을 그대로 재현한다
-
-글꼴, 셀 병합, 열 정렬, 셀 안 일부 단어만 색을 바꾸는 처리까지 원본과 동일하게
-생성합니다. 담당자가 서식을 다시 만지지 않고 바로 인쇄할 수 있어야 실제로 쓰입니다.
-
----
-
-## 코드 구성
-
-| 파일 | 줄 수 | 역할 |
-| --- | --- | --- |
-| [`src/app.py`](src/app.py) | ~520 | Streamlit 화면, 상태 관리, 편집 반영, 클립보드 감시 연결 |
-| [`src/extract.py`](src/extract.py) | ~180 | LLM 호출, 이미지 리사이즈, 실패 원인 자가 진단 |
-| [`src/prompt.py`](src/prompt.py) | ~170 | 도메인 프롬프트 — 공통 규칙 13개 + 거래처별 양식 4종 |
-| [`src/extract_schema.py`](src/extract_schema.py) | ~150 | Structured Outputs 스키마 (strict 모드) |
-| [`src/parsers.py`](src/parsers.py) | ~230 | 엑셀 발주서 파서. 헤더를 읽어 열 위치를 동적 매핑 |
-| [`src/rules.py`](src/rules.py) | ~370 | 마스터 조회, 금액 계산, 검증 15개, 중복 · 변경 감지 |
-| [`src/output.py`](src/output.py) | ~510 | 문서 3종 생성, 서식 재현, 편집값 역파싱 |
-| [`src/clipboard_watch.py`](src/clipboard_watch.py) | ~65 | 클립보드 감시 — 캡처하면 자동 추가 |
-| [`src/evaluate.py`](src/evaluate.py) | ~170 | 정답셋 대조 정확도 측정 |
-
-자세한 내용은 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 를 참고하세요.
-
-### 데이터 흐름
+기존에 작성한 장부를 다시 활용할 수도 있습니다.
 
 ```mermaid
-sequenceDiagram
-    participant U as 담당자
-    participant A as app.py
-    participant E as extract.py
-    participant R as rules.py
-    participant O as output.py
-    participant D as SQLite
-
-    U->>A: 발주서 업로드 (또는 캡처)
-    A->>E: extract_order(images)
-    E->>E: 리사이즈 → base64 → LLM 호출
-    E-->>A: 표준 JSON
-    A->>R: validate(order, master)
-    R->>D: 최근 7일 · 2일 조회
-    D-->>R: 과거 주문
-    R-->>A: 검증 결과 (등급 4단계)
-    A-->>U: 장부 표 + 경고 표시
-    U->>A: 셀 수정
-    A->>A: apply_edit() — 원본 JSON 갱신
-    U->>A: 파일 생성
-    A->>O: build_ledger / worksheet / erp
-    O-->>U: xlsx 3종
-    A->>D: 출력 이력 기록
+flowchart LR
+    A["기존 장부.xls<br/>또는 FitOrder 장부.xlsx"] --> B["장부 변환"]
+    B --> C["작업지시서.xlsx"]
+    B --> D["경영박사_EDI.xls"]
 ```
 
 ---
 
-## 도메인 규칙
+## 핵심 특징
 
-문서화된 자료가 없어 실제 데이터에서 역산했습니다.
-전표 4,783행과 품목 마스터 1,201건을 대조해 규칙을 확정하고,
-계산 결과를 실제 전표값과 맞춰 검증했습니다.
+### 1. AI는 읽기만 하고 계산은 코드가 수행
+
+AI의 응답을 바로 문서에 쓰지 않습니다.
+
+| 단계 | 역할 | 담당 |
+| :---: | :--- | :--- |
+| 1 | 서식이 달라도 발주 내용을 읽음 | LLM / 엑셀 파서 |
+| 2 | 품목·단가·면적·금액·부가세 계산 및 검증 | Python 코드 |
+| 3 | 오류·확인·중복·변경 항목만 검토 | 담당자 |
+
+### 2. 이상치만 확인
+
+- 🟥 오류: 필수값 누락·규칙 위반, 파일 생성 차단
+- 🟨 확인: 큰 치수·손잡이 길이 등 확인 권장
+- 🟪 중복·변경: 최근 주문과 비교해 표시
+- ℹ️ 예외: 부속·수리 등 장부 제외 대상
+
+상태를 선택하면 해당 장부 행, 발생 원인, 발주서 원본을 함께 확인할 수 있습니다.
+
+### 3. 현장에서 쓰던 문서 형태 유지
+
+- 글꼴·셀 병합·열 너비·인쇄 구조 재현
+- `원코드` 초록, `셔터` 빨강, `틀안` 파랑, `선불` 빨강
+- 작업지시서는 내부 표시와 장부용 접두사를 제거
+- 경영박사 EDI는 거래처별 관리코드·단가 열을 적용
+
+### 4. 이미지부터 기존 장부까지 한 화면에서 처리
+
+업로드 영역은 하나이며 처리 목적에 따라 버튼을 선택합니다.
+
+- **분석 시작**: 이미지·PDF·발주 엑셀을 새 주문으로 분석
+- **장부 변환**: 기존 `.xls` 또는 FitOrder `.xlsx` 장부로 작업지시서·EDI 생성
+
+장부 변환은 AI API를 사용하지 않습니다.
+
+---
+
+## 지원 입력
+
+| 형식 | 처리 방식 | 비고 |
+| :--- | :--- | :--- |
+| PNG / JPG / JPEG | GPT-4o Structured Outputs | 카카오톡 캡처 포함 |
+| PDF | 페이지 이미지 변환 후 분석 | 최대 50페이지 |
+| XLSX / XLS 발주서 | 거래처별 전용 파서 | 인터넷 연결 불필요 |
+| XLSX / XLS 장부 | 장부 역파싱 | 작업지시서·EDI 출력 |
+| 클립보드 이미지 | 자동 감시 또는 붙여넣기 | 서버와 브라우저가 같은 PC일 때 |
+
+현재 코드에 등록된 거래처:
+
+`DI` · `휴안` · `M` · `DU` · `RT` · `JO` · `JL` · `SP` · `유앤` · `아지트` · `WT` · `인천)트루` · `미래가공` · `보노` · `MS`
+
+거래처 규칙은 [`docs/RULES.md`](docs/RULES.md)에서 확인할 수 있습니다.
+
+---
+
+## 문서별 변환 예시
+
+| 장부 | 작업지시서 | 경영박사 EDI |
+| :--- | :--- | :--- |
+| `JO (K)` | `JO` | 거래처 관리코드 |
+| ` B 원코드 200` | `원코드 200` | `B200(IV)-원코드` |
+| `54.5 X 116` | `54.5 X 116` | 면적·단가·금액·부가세 |
+| 내부 표시·배송 기호 유지 | 제작에 필요한 값만 유지 | EDI 지정 열에 출력 |
+
+면적과 금액은 부동소수점 오차를 피하기 위해 `Decimal`로 계산합니다.
 
 ```python
-# 면적(헤베) — 소수 둘째 자리 반올림, 최소 1.5
-raw  = Decimal(가로) / 100 * Decimal(세로) / 100
+raw = Decimal(가로) / 100 * Decimal(세로) / 100
 헤베 = raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 수량 = max(헤베, Decimal("1.5"))
-
-# 검산: 110 × 235 → 2.585 → 2.59 → × 21,300 = 55,167 → 부가세 5,517
+금액 = (Decimal(단가) * 수량).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
 ```
-
-`float` 은 `round(2.585, 2)` 를 `2.58` 로 계산합니다.
-금액을 다루므로 전 계산을 `Decimal` 로 처리했습니다.
-
-주요 규칙 목록은 [`docs/RULES.md`](docs/RULES.md) 에 정리했습니다.
 
 ---
 
-## 정확도
+## 빠른 시작
 
-실제 발주서 21건 · 38행 기준입니다.
+### 준비 사항
 
-| 항목 | 정확도 |
-| --- | --- |
-| 품목 · 색상 | **100 %** |
-| 가로 | **100 %** |
-| 수량 | **100 %** |
-| 세로 | 97 % |
-| 손잡이 길이 | 97 % |
-| 손잡이 방향 | 89 % |
-
-제작 손실로 직결되는 항목에는 오차가 없었습니다.
-남은 오차는 검증 규칙이 표시하여 담당자가 확인합니다.
-
-```bash
-cd src
-python evaluate.py ../data/samples          # 전체
-python evaluate.py ../data/samples DU       # 거래처 하나
-```
-
-처리 성능은 엑셀 발주서 18개(주문 54건 · 424행)를 오류 없이 처리하고
-문서 3종 생성까지 1초 미만입니다.
-
----
-
-## 설치
-
-### 요구사항
-
+- Windows 10/11
 - Python 3.12
-- OpenAI API 키
-- Windows (클립보드 감시 기능 사용 시)
+- 이미지·PDF 분석 시 OpenAI API 키
+- `data/master/fitorder_master.xlsx` 마스터 파일
 
-### 개발 환경
+### 설치
 
 ```bash
-git clone https://github.com/<사용자명>/fitorder.git
-cd fitorder
-
+git clone https://github.com/sieunzzz/FitOrder.git
+cd FitOrder
 python -m venv .venv
-.venv\Scripts\activate          # Windows
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-`.env.example` 을 복사해 `.env` 를 만들고 키를 넣습니다.
+`.env.example`을 복사해 `.env`를 만든 뒤 API 키를 입력합니다.
 
+```dotenv
+OPENAI_API_KEY=본인의_API_키
 ```
-OPENAI_API_KEY=sk-proj-...
-```
 
-### 마스터 데이터
-
-`data/master/fitorder_master.xlsx` 가 필요합니다.
-실제 거래처 단가가 포함되어 저장소에는 올리지 않았습니다.
-필요한 시트 구조는 [`data/master/README.md`](data/master/README.md) 에 있습니다.
+> API 키와 실제 거래처·단가 데이터는 GitHub에 올리지 마세요.
 
 ### 실행
+
+```bash
+run.bat
+```
+
+또는 개발 모드로 실행합니다.
 
 ```bash
 cd src
 streamlit run app.py
 ```
 
-Windows 에서는 `run.bat` 을 실행하면 브라우저가 앱 모드로 열립니다.
+---
 
-### 배포
+## 폴더 구조
 
-| 방식 | 방법 | 특징 |
-| --- | --- | --- |
-| 포터블 | `setup_portable.bat` → `run.bat` | Python 설치 불필요, 폴더 복사로 배포 |
-| 실행파일 | `release/build.bat` | PyInstaller 로 exe 생성 |
-
-자세한 절차는 [`docs/DEPLOY.md`](docs/DEPLOY.md) 를 참고하세요.
+```text
+FitOrder/
+├─ src/
+│  ├─ app.py                 # 화면·상태·장부 편집·다운로드
+│  ├─ extract.py             # 이미지·PDF 분석과 오류 진단
+│  ├─ prompt.py              # 공통·거래처별 추출 규칙
+│  ├─ extract_schema.py      # Structured Outputs 스키마
+│  ├─ parsers.py             # 거래처별 XLS/XLSX 발주서 파서
+│  ├─ rules.py               # 마스터 조회·계산·검증·중복 감지
+│  ├─ output.py              # 장부·작업지시서·EDI 생성·장부 역변환
+│  ├─ clipboard_watch.py     # 클립보드 이미지 감시
+│  └─ evaluate.py            # 정답 데이터 기반 정확도 측정
+├─ data/
+│  ├─ master/                # 품목·거래처·단가 마스터(비공개)
+│  └─ samples/               # 평가용 발주서·정답(비공개)
+├─ db/                       # 출력 이력 SQLite(자동 생성)
+├─ out/                      # 생성 문서·업로드 임시파일(자동 생성)
+├─ assets/                   # GitHub 문서용 로고
+├─ docs/                     # 구조·규칙·배포 문서
+├─ release/                  # PyInstaller 실행파일 빌드 설정
+├─ requirements.txt
+├─ run.bat
+└─ .env                      # API 키(커밋 금지)
+```
 
 ---
 
-## 데이터 취급
+## 주요 코드
 
-실제 거래 자료를 다루므로 다음을 지켰습니다.
+| 파일 | 역할 |
+| :--- | :--- |
+| [`src/app.py`](src/app.py) | 업로드, 검토표, 상태 상세, 행 삭제, 장부 변환 |
+| [`src/extract.py`](src/extract.py) | 이미지 리사이즈, PDF 페이지 처리, LLM 호출 |
+| [`src/parsers.py`](src/parsers.py) | 엑셀 발주서의 헤더·값 기반 동적 파싱 |
+| [`src/rules.py`](src/rules.py) | 품목 조회, `Decimal` 계산, 검증, 중복·변경 탐지 |
+| [`src/output.py`](src/output.py) | 문서 생성, 서식 재현, XLS/XLSX 장부 역파싱 |
 
-- 마스터 데이터에서 대표자명 · 사업자등록번호 · 연락처 · 이메일 · 주소를 제외
-- 검증용 파일은 고객명 · 현장명 · 전화번호를 가명으로 치환
-- 저장소에 발주서 샘플과 마스터 데이터를 포함하지 않음
-
-외부로 전송되는 것은 **발주서 이미지와 프롬프트뿐**입니다.
-거래처별 단가, 장부 데이터, 계산 결과는 로컬에만 존재합니다.
-엑셀 발주서는 파서로 직접 읽으므로 네트워크를 사용하지 않습니다.
-
----
-
-## 알려진 한계
-
-- 담당자가 임의로 줄여 쓰는 기재사항 표기는 그대로 재현하지 못합니다
-  (정보가 누락되지는 않고 더 자세히 나옵니다)
-- 이미지 추출에 인터넷 연결이 필요합니다
-- 새 거래처를 추가할 때 양식 분석과 프롬프트 규칙 추가가 필요합니다
-- 담당자 수정 이력을 학습에 반영하는 기능은 미구현입니다
-- 화면에 쌓인 장부는 `파일 생성` 을 누르기 전까지 저장되지 않습니다
+전체 데이터 흐름은 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), 배포 방법은 [`docs/DEPLOY.md`](docs/DEPLOY.md)를 참고하세요.
 
 ---
 
-## 라이선스
+## 정확도와 평가
 
-[MIT](LICENSE)
+실제 발주서 21건·38행 기준:
+
+| 항목 | 정확도 |
+| :--- | ---: |
+| 품목·색상 | **100%** |
+| 가로 | **100%** |
+| 수량 | **100%** |
+| 세로 | 97% |
+| 손잡이 길이 | 97% |
+| 손잡이 방향 | 89% |
+
+```bash
+cd src
+python evaluate.py ../data/samples
+python evaluate.py ../data/samples DU
+```
+
+프롬프트 변경 후 정확도를 다시 측정할 때는 `data/samples/_cache`를 비우고 실행합니다.
+
+---
+
+## 데이터와 보안
+
+- 외부 API로 전송되는 정보: 발주서 이미지와 추출 프롬프트
+- 로컬에만 저장되는 정보: 품목 마스터, 단가, 계산 결과, 장부, 출력 이력
+- `.env`, `data/master`, `data/samples`, `db`, `out`은 `.gitignore`에서 제외
+- `out/_clip`, `out/_upload`에는 실제 발주서가 남을 수 있으므로 배포 전에 정리
+
+---
+
+## 문서
+
+- [시스템 구조](docs/ARCHITECTURE.md)
+- [도메인 규칙](docs/RULES.md)
+- [배포 안내](docs/DEPLOY.md)
+- [기여 방법](docs/CONTRIBUTING.md)
+
+---
+
+<div align="center">
+
+반복 입력은 줄이고, 제작에 필요한 확인에 집중합니다.
+
+</div>

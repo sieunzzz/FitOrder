@@ -13,8 +13,8 @@ if not exist "..\python\python.exe" (
     exit /b 1
 )
 
-echo [1/3] installing pyinstaller
-"..\python\python.exe" -m pip install pyinstaller
+echo [1/3] installing dependencies and pyinstaller
+"..\python\python.exe" -m pip install -r "..\requirements.txt" pyinstaller
 if errorlevel 1 goto fail
 
 echo.

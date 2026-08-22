@@ -24,12 +24,12 @@ if errorlevel 1 goto fail
 echo.
 echo [2/3] installing packages (takes a few minutes)
 "python\python.exe" -m pip install --upgrade pip
-"python\python.exe" -m pip install streamlit pandas openpyxl pillow openai python-dotenv
+"python\python.exe" -m pip install streamlit pandas openpyxl pillow openai python-dotenv pymupdf
 if errorlevel 1 goto fail
 
 echo.
 echo [3/3] verify
-"python\python.exe" -c "import streamlit, pandas, openpyxl, PIL, openai"
+"python\python.exe" -c "import streamlit, pandas, openpyxl, PIL, openai, pymupdf"
 if errorlevel 1 goto fail
 echo   all packages OK
 

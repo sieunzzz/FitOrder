@@ -5,12 +5,12 @@ from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 datas, binaries, hiddenimports = [], [], []
 for pkg in ("streamlit", "altair", "pyarrow", "pandas", "openpyxl",
-            "PIL", "openai", "dotenv", "narwhals", "pydeck"):
+            "PIL", "openai", "dotenv", "narwhals", "pydeck", "pymupdf"):
     d, b, h = collect_all(pkg)
     datas += d; binaries += b; hiddenimports += h
 
 for pkg in ("streamlit", "pandas", "openpyxl", "openai", "pillow",
-            "python-dotenv", "altair", "pyarrow"):
+            "python-dotenv", "altair", "pyarrow", "pymupdf"):
     try:
         datas += copy_metadata(pkg)
     except Exception:

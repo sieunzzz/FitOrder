@@ -6,7 +6,8 @@ strict 모드 제약:
   - 모든 property 를 required 에 포함 (선택 항목은 ["string","null"] 로)
 """
 
-CLIENTS = ["DI", "휴안", "M", "DU", "RT", "JO", "JL"]
+CLIENTS = ["DI", "휴안", "M", "DU", "RT", "JO", "JL", "SP",
+           "유앤", "아지트", "WT", "인천)트루", "미래가공", "보노", "MS"]
 
 _ITEM = {
     "type": "object",
@@ -37,12 +38,13 @@ _ITEM = {
         "수량": {
             "type": ["string", "null"],
             "description": "공지·부속 개수 등 특수 표기만. 일반 창은 null. "
-                           "예 '공지','½','2set'. 창이 1개라는 뜻으로 '1'을 넣지 말 것",
+                           "손잡이/모형 칸의 '½','1/3','1/4'는 반드시 "
+                           "'1/2','1/3','1/4'로 적음. 창이 1개라는 뜻으로 '1'은 넣지 말 것",
         },
         "손잡이방향": {
             "type": ["string", "null"],
             "enum": ["좌", "우", None],
-            "description": "발주서에 '좌'/'우' 표기. 없으면 null",
+            "description": "발주서에 '좌'/'우' 표기. 좌|우 두 열이면 숫자가 적힌 열을 방향으로 읽음. 없으면 null",
         },
         "손잡이길이": {
             "type": ["integer", "null"],
@@ -120,9 +122,13 @@ EXTRACTION_SCHEMA = {
         "거래처": {
             "type": ["string", "null"],
             "enum": CLIENTS + [None],
-            "description": "발주서 제목/발신처로 판별. 불확실하면 null",
+            "description": "발주서 제목/로고/발신처로 판별. 두창·두창블라인드는 DU. 불확실하면 null",
         },
         "발주일": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
+        "주문번호": {
+            "type": ["string", "null"],
+            "description": "SP의 주문일자-주문번호. 예: 17-9. SP가 아니면 null",
+        },
         "고객명": {"type": ["string", "null"], "description": "발주서 상단 '고객명' 값"},
         "items": {"type": "array", "items": _ITEM},
         "배송": _DELIVERY,
@@ -133,7 +139,7 @@ EXTRACTION_SCHEMA = {
         "전체기재사항": {
             "type": ["string", "null"],
             "description": "표 하단 비고의 공통 지시와 주문번호. "
-                           "'피스 동봉해주세요'→'피스', '( 기재 : 홍길동 DW )'→'홍길동DW', "
+                           "'피스 동봉해주세요'→'피스', '( 기재 : 임지애 DW )'→'임지애DW', "
                            "'주문 번 호 : 226095'→'226095'. 여러 개면 / 로 연결. "
                            "포장 관련 지시(비닐포장·걷비닐)는 제외",
         },
@@ -149,7 +155,7 @@ EXTRACTION_SCHEMA = {
         },
     },
     "required": [
-        "거래처", "발주일", "고객명", "items", "배송",
+        "거래처", "발주일", "주문번호", "고객명", "items", "배송",
         "전체원문", "전체기재사항", "변경요청", "변경문구",
     ],
 }

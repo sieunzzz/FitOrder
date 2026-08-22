@@ -14,17 +14,36 @@ from pathlib import Path
 import openpyxl
 
 # ─────────────────────────────────────────────
-# 거래처 (1차 구현 7개사)
+# 거래처
 # ─────────────────────────────────────────────
 CLIENT_INFO = {
     # 상호: (관리코드, 단가컬럼, 기본배송, 내부표시, 입력형태)
-    "DI":   ("대구",       "출고L가", "DI/SP",   "(N)", "excel"),
+    "DI":   ("대구",       "출고L가", "DI/SP",   "",    "excel"),
     "휴안": ("광주",       "출고I가", "택배",     "(K)", "excel"),
     "M":    ("대구",       "출고I가", None,      "(K)", "image"),
     "DU":   ("대구광역시", "출고I가", None,      "(K)", "image"),
     "RT":   ("경기도",     "출고I가", "판별필요", "(K)", "image"),
     "JO":   ("대구광역시", "출고I가", None,      "(K)", "image"),
     "JL":   ("대구",       "출고I가", None,      "(K)", "image"),
+    "SP":   ("대구",       "출고H가", "배달",    "",    "pdf"),
+    "유앤": ("대구광역시", "출고A가", "택배",    "(K)", "excel"),
+    "아지트": ("대구",     "출고B가", "배달",    "(K)", "image"),
+    "WT":   ("경상북도",   "출고I가", "내사",    "(F)", "image"),
+    "인천)트루": ("인천",  "출고A가", "택배",    "(K)", "image"),
+    "미래가공": ("대구",   "출고A가", "화물",    "(K)", "excel"),
+    "보노": ("경기도",     "출고A가", "화물",    "(K)", "excel"),
+    "MS":   ("대구광역시", "출고A가", "배달",    "(K)", "image"),
+}
+
+# 경영박사 EDI에 기록할 실제 등록 상호. 장부/FitOrder 표시는 CLIENT_INFO의 키다.
+ERP_CLIENT_NAME = {
+    "유앤": "주식회사 유앤아이티엔에스",
+    "아지트": "아지트(GB)",
+    "WT": "WT",
+    "인천)트루": "인천)주식회사 트루갤러리",
+    "미래가공": "주식회사 미래가공",
+    "보노": "안산)주식회사 보노",
+    "MS": "MS",
 }
 
 # 세로 규격에 " 표기를 쓰지 않는 거래처
@@ -160,13 +179,19 @@ def normalize_handle(length):
     return r, r != int(length)
 
 
-def ledger_color(code, kind, type_):
+def ledger_color(code, kind, type_, prefix="B"):
     """장부 색상 열 문자열"""
     if not code:
         return None
+    prefix = str(prefix or "B").strip().upper()
+    if prefix not in {"B", "H", "R", "C"}:
+        prefix = "B"
     if type_ == "L자":
-        return f"B L18-{kind} {code}"
-    return f"B {code}" if kind == "투코드" else f"B {kind} {code}"
+        text = f"{prefix} L18-{kind} {code}"
+    else:
+        text = f"{prefix} {code}" if kind == "투코드" else f"{prefix} {kind} {code}"
+    # 장부 품목 칸에서만 맨 앞에 여백 한 칸을 둔다.
+    return " " + text
 
 
 # 장부 색상 열 부분 서식 (D4 에서 CellRichText 로 적용)
@@ -210,16 +235,18 @@ def validate(order, M):
         if h in (None, ""):
             out.append(("red", "세로누락", "세로 치수가 없습니다", i))
         if w and h:
-            if w > h and h < 100:
-                out.append(("yellow", "치수순서의심",
-                            f"가로({w}) > 세로({h}) — 순서 확인", i))
+            # 가로·세로의 대소관계만으로는 순서 오독을 판단하지 않는다.
+            # 제작 한계에 가까운 큰 치수만 확인 대상으로 한다.
+            if w >= 250 or h >= 400:
+                out.append(("yellow", "대형치수확인",
+                            f"대형 치수 {w}x{h} — "
+                            + ("가로 250cm 이상" if w >= 250 else "")
+                            + (" / " if w >= 250 and h >= 400 else "")
+                            + ("세로 400cm 이상" if h >= 400 else ""), i))
             lo = MIN_WIDTH.get(kind)
             if lo and w < lo:
                 out.append(("red", "최소사이즈미달",
                             f"{kind} 최소 가로 {lo}cm 미만 ({w}cm)", i))
-            if not (10 <= w <= 400) or not (10 <= h <= 400):
-                out.append(("yellow", "치수범위이상",
-                            f"비정상적인 치수 {w}x{h}", i))
 
         if not code:
             out.append(("red", "품목미등록", "색상 코드를 읽지 못했습니다", i))
@@ -232,9 +259,12 @@ def validate(order, M):
                 out.append(("red", "단가없음",
                             f"{hit['품명']} — {hit['단가등급']} 단가가 0입니다", i))
 
-        if it.get("손잡이방향") is None:
-            out.append(("yellow", "손잡이미기재",
-                        "방향 미기재 — 우측 기본 적용", i))
+        handle_length = it.get("손잡이길이")
+        if h and handle_length is not None \
+                and abs(float(h) - float(handle_length)) >= 100:
+            out.append(("yellow", "손잡이길이차이",
+                        f"세로 {h}cm / 손잡이 {handle_length}cm — "
+                        "100cm 이상 차이", i))
         _, adj = normalize_handle(it.get("손잡이길이"))
         if adj:
             out.append(("yellow", "손잡이길이보정",
@@ -260,7 +290,7 @@ def validate(order, M):
                     + " · 대상 주문을 확인하세요", None))
 
     if client == "RT" and not (order.get("배송") or {}).get("방식"):
-        out.append(("red", "배송판별불가", "RT — 화물/택배 구분 불가", None))
+        out.append(("red", "배송판별불가", "RT — 택배/화물 구분 불가", None))
 
     return out
 
@@ -277,7 +307,8 @@ def worst(issues):
 # ─────────────────────────────────────────────
 DUP_LOOKBACK_DAYS = 7
 CHANGE_LOOKBACK_DAYS = 2
-SIZE_TOL = 1.0          # 치수 ±1cm 이내면 같은 창으로 의심
+SIZE_TOL = 0.0          # 중복은 치수가 완전히 같을 때만 (±1cm 의심 제거)
+CHANGE_TOL = 1.0        # 변경 후보 판정에만 허용 오차를 둔다
 
 
 def item_key(client, it):
@@ -287,9 +318,9 @@ def item_key(client, it):
             it.get("손잡이방향"), it.get("손잡이길이"))
 
 
-def _near(a, b):
+def _near(a, b, tol=SIZE_TOL):
     try:
-        return abs(float(a) - float(b)) <= SIZE_TOL
+        return abs(float(a) - float(b)) <= tol
     except (TypeError, ValueError):
         return a == b
 
@@ -300,7 +331,8 @@ def similar(client_a, a, client_b, b):
         return False
     if a.get("품목코드") != b.get("품목코드"):
         return False
-    return _near(a.get("가로"), b.get("가로")) and _near(a.get("세로"), b.get("세로"))
+    return (_near(a.get("가로"), b.get("가로"))
+            and _near(a.get("세로"), b.get("세로")))
 
 
 def find_duplicates(orders, past=None):
@@ -321,12 +353,6 @@ def find_duplicates(orders, past=None):
             out.append(("review", "중복", f"{seen[k]}행과 완전히 동일합니다", n))
         else:
             seen[k] = n
-            for m, (_, c2, it2) in enumerate(rows[:n - 1], 1):
-                if similar(c, it, c2, it2):
-                    out.append(("review", "중복의심",
-                                f"{m}행과 치수가 거의 같습니다 "
-                                f"({it2.get('가로')}x{it2.get('세로')})", n))
-                    break
         for label, pc, pit in (past or []):
             if item_key(pc, pit) == k:
                 out.append(("review", "과거중복",
@@ -342,7 +368,8 @@ def change_candidate(client_a, a, client_b, b):
         return False
     if a.get("품목코드") != b.get("품목코드"):
         return False
-    return _near(a.get("가로"), b.get("가로")) or _near(a.get("세로"), b.get("세로"))
+    return (_near(a.get("가로"), b.get("가로"), CHANGE_TOL)
+            or _near(a.get("세로"), b.get("세로"), CHANGE_TOL))
 
 
 def find_changes(orders, past):

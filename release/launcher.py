@@ -20,7 +20,8 @@ def base_dir() -> Path:
     """exe 로 묶인 경우와 스크립트 실행을 모두 처리"""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
-    return Path(__file__).resolve().parent
+    # Source mode starts from release/launcher.py. The project root is its parent.
+    return Path(__file__).resolve().parent.parent
 
 
 def free_port(start: int) -> int:
