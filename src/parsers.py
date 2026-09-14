@@ -3,16 +3,24 @@
 출력 형태는 extract.extract_order() 와 동일하다.
 """
 import re
+import os
+import tempfile
+from pathlib import Path
 
 import openpyxl
 
-from rules import DI_COLOR, DI_COLOR_UNSURE
+from rules import (DI_CODE_ORDER, DI_COLOR, DI_COLOR_UNSURE, clean_delivery_notice,
+                   di_mix_from_codes, di_mix_info, normalize_di_color_name, BONO_STYLE_CLIENTS)
+from holding import (HOLDING_FEATURE_ENABLED, holding_product_from_text, looks_like_holding_operation,
+                     normalize_holding_operation)
 
 SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*[*x×X]\s*(\d+(?:\.\d+)?)")
 
 
 def _blank_item():
-    return {"품목코드": None, "색상원문": None, "타입": "C자", "종류": "투코드",
+    return {"제품군": "블라인드", "홀딩방식": None, "홀딩레일": None,
+            "홀딩상하로라": False, "홀딩부속": None, "홀딩부속색상": None,
+            "품목코드": None, "색상원문": None, "타입": "C자", "종류": "투코드",
             "가로": None, "세로": None, "수량": None, "손잡이방향": None,
             "손잡이길이": None, "연창": False, "설치장소": None,
             "기재사항": None, "예외품목": None, "원문": None,
@@ -33,11 +41,15 @@ def _shell(client):
 # ─────────────────────────────────────────────
 def _huan_product(s):
     """'YL500 L원코드' -> (500, L자, 원코드)"""
-    s = str(s or "").strip()
-    m = re.search(r"([A-Z]{1,2})?\s*(\d{3}[A-Za-z]*)", s)
+    s = str(s or "").strip().upper()
+    m = re.search(r"([A-Z]{1,2})?\s*(\d{3,4}[A-Za-z]*)", s)
     code = m.group(2) if m else None
-    type_ = "L자" if re.search(r"\bL\s*(?=원|투|셔|18|타입|자)", s) or "L18" in s else "C자"
-    if "셔터" in s:
+    # 휴안은 L투코드를 `L코드`, `L투`, `L 투코드` 등으로 줄여 쓰기도 한다.
+    # L18/L21도 같은 L타입으로 읽되 실제 출력 품명은 공통 규칙상 L18이다.
+    type_ = ("L자" if re.search(
+        r"(?:^|[\s/_-])L\s*(?=원|투|셔|코드|18|21|타입|자|$)", s)
+        else "C자")
+    if "셔터" in s or "심플" in s:          # 심플 = 셔터
         kind = "셔터"
     elif "원코드" in s or re.search(r"원\s*코드", s):
         kind = "원코드"
@@ -87,32 +99,143 @@ def _short_addr(addr):
     return s
 
 
+def _huan_message_info(value):
+    """휴안 배송메시지에서 제작 기재사항(노피스/석고앙카)과 나머지를 분리한다.
+
+    예: ★이지픽스메탈(3) 1 -> 노피스(3)1
+        ★석고용앙카나사 1 -> 석고앙카1
+    """
+    text = str(value or "").strip()
+    if not text:
+        return [], None
+    specials = []
+
+    def add(value):
+        if value and value not in specials:
+            specials.append(value)
+
+    # 이미 줄여 적은 메시지도 그대로 인식한다.
+    for m in re.finditer(r"노피스\s*\((\d+)\)\s*(\d+)", text):
+        add(f"노피스({m.group(1)}){m.group(2)}")
+    for m in re.finditer(r"석고앙카\s*(\d*)", text):
+        add(f"석고앙카{m.group(1)}" if m.group(1) else "석고앙카")
+    for word in ("콘크리트", "석고날개"):
+        if word in text:
+            add(word)
+    if "칼블럭" in text:          # 석고칼블럭-날개 = 석고날개 (2026-09-14)
+        add("석고날개")
+
+    # 원 발주 메시지의 제품명을 공장 장부용 짧은 표기로 변환한다.
+    for m in re.finditer(r"[★☆*]*\s*이지픽스메탈\s*\((\d+)\)\s*(\d+)", text):
+        add(f"노피스({m.group(1)}){m.group(2)}")
+    for m in re.finditer(r"[★☆*]*\s*석고용앙카나사\s*(\d+)", text):
+        add(f"석고앙카{m.group(1)}")
+
+    remainder = text
+    remainder = re.sub(r"[★☆*]*\s*이지픽스메탈\s*\(\d+\)\s*\d+", " ", remainder)
+    remainder = re.sub(r"[★☆*]*\s*석고용앙카나사\s*\d+", " ", remainder)
+    remainder = re.sub(r"노피스\s*\(\d+\)\s*\d+", " ", remainder)
+    remainder = re.sub(r"석고앙카\s*\d*", " ", remainder)
+    remainder = re.sub(r"석고\s*칼\s*블럭\s*-?\s*(?:날개)?", " ", remainder)
+    remainder = remainder.replace("콘크리트", " ").replace("석고날개", " ")
+    remainder = re.sub(r"\s*[-/|,]+\s*", "/", remainder)
+    remainder = re.sub(r"/{2,}", "/", remainder).strip(" /-★☆*")
+    return specials, (remainder or None)
+
+
+def _huan_etc_info(value):
+    """휴안 '기타' 칸: 추가부속(노피스/석고앙카) · 손잡이길이 · 요구사항을 분리한다."""
+    text = str(value or "").strip()
+    if not text:
+        return [], None, None
+    handle = None
+    hm = re.search(r"(?:손잡이\s*(?:길이)?|손길이|손|줄|끈)\s*[:=]?\s*(\d{2,3})(?!\d)", text)
+    if hm:
+        handle = int(hm.group(1))
+        text = (text[:hm.start()] + " " + text[hm.end():]).strip()
+    specials, remainder = _huan_message_info(text)
+    return specials, handle, remainder
+
+
+def _apply_huan_message_notes(order):
+    """휴안 추가부속 (2026-09-13 사용자 확정).
+
+    - 노피스는 장부에 별도 부속행: 색상 칸 `노피스(3)`, 수량 칸 `2EA`.
+    - 석고앙카 등은 한 사람 주문 중 **세로가 가장 긴** 창 맨 앞에 1회 기록한다
+      (경영박사도 그 창에만 `앙카3`으로 적힌다).
+    """
+    raw_messages = order.pop("_huan_messages", [])
+    raw_text = "/".join(dict.fromkeys(
+        str(x).strip() for x in raw_messages if str(x or "").strip()))
+    specials, remainder = _huan_message_info(raw_text)
+    order.setdefault("배송", {})["전달사항"] = clean_delivery_notice(remainder)
+    specials = list(dict.fromkeys(specials + order.pop("_huan_etc_specials", [])))
+    accessories, notes = [], []
+    for special in specials:
+        m = re.fullmatch(r"노피스\((\d+)\)(\d+)", special)
+        if m:
+            # 노피스 수량은 set 단위(2026-09-14: 3EA → 3set).
+            accessories.append({"표시": f"노피스({m.group(1)})", "수량": f"{m.group(2)}set"})
+        else:
+            notes.append(special)
+    if accessories:
+        order["_huan_accessories"] = accessories
+    if not notes or not order.get("items"):
+        return
+    candidates = [(i, it) for i, it in enumerate(order["items"])
+                  if not it.get("예외품목") and it.get("세로") not in (None, "")]
+    if not candidates:
+        return
+    _, target = max(candidates, key=lambda pair: (float(pair[1].get("세로") or 0), -pair[0]))
+    existing = [x.strip() for x in str(target.get("기재사항") or "").split("/") if x.strip()]
+    target["기재사항"] = "/".join(notes + [x for x in existing if x not in notes]) or None
+
+
 def parse_huan(path):
     """휴안 발주 엑셀 -> 주문 리스트 (수취인 단위로 분리)"""
     ws = openpyxl.load_workbook(path, data_only=True).worksheets[0]
     orders, cur, last_prod = [], None, (None, "C자", "투코드", "")
+    # '기타' 칸(추가부속·손길이·요구사항)은 헤더 이름으로 찾는다.
+    etc_col = next((c for c in range(1, ws.max_column + 1)
+                    if "기타" in str(ws.cell(1, c).value or "")), None)
     for r in range(2, ws.max_row + 1):
         g = lambda c: ws.cell(r, c).value
         size = g(9)
         if not size:
             continue
         name = g(3)
-        if name:                                  # 새 주문 시작
+        if name:
+            name_text = str(name).strip()
+            phone_text = str(g(4) or "").strip()
+            address_text = _short_addr(g(6))
+            same_person = bool(
+                cur and cur.get("고객명") == name_text
+                and (not phone_text or phone_text == cur["배송"].get("연락처"))
+                and (not address_text or address_text == cur["배송"].get("주소"))
+            )
+        else:
+            same_person = False
+        if name and not same_person:               # 새 수령인 주문 시작
             cur = _shell("휴안")
             d = g(1)
             cur["발주일"] = d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else None
-            cur["고객명"] = str(name).strip()
+            cur["고객명"] = name_text
             cur["배송"].update({
-                "방식": "택배", "주소": _short_addr(g(6)),
-                "수령인": str(name).strip(),
-                "연락처": str(g(4) or "").strip(),
+                "방식": "택배", "주소": address_text,
+                "수령인": name_text,
+                "연락처": phone_text,
                 "선불착불": "선불",
-                "전달사항": (str(g(12)).strip() if g(12) else None),
+                "전달사항": None,
             })
+            cur["_huan_messages"] = []
             cur["전체기재사항"] = "포장비용"       # 휴안은 창당 포장비
             orders.append(cur)
         if cur is None:
             continue
+        if g(12) and etc_col != 12:
+            message = str(g(12)).strip()
+            if message and message not in cur.setdefault("_huan_messages", []):
+                cur["_huan_messages"].append(message)
         m = SIZE.search(str(size))
         it = _blank_item()
         if m:
@@ -124,29 +247,126 @@ def parse_huan(path):
             code, type_, kind, _ = last_prod
         else:
             code, type_, kind = None, "C자", "투코드"
+        raw_handle = str(g(10) or "").strip()
+        dir_match = re.search(r"[좌우]", raw_handle)
+        len_match = re.search(r"(?:손잡이(?:길이)?|손|줄|봉|각도봉)?\s*[:=/-]?\s*(\d{2,3})(?!\d)", raw_handle)
         it.update({"품목코드": code,
                    "색상원문": (str(g(7)).strip() if g(7) else last_prod[3]),
                    "타입": type_, "종류": kind,
-                   "손잡이방향": (str(g(10)).strip() if g(10) else None),
-                   "기재사항": cur["고객명"], "원문": f"{g(7)} {size} {g(10)}"})
+                   "손잡이방향": (dir_match.group(0) if dir_match else None),
+                   "손잡이길이": (int(len_match.group(1)) if len_match else None),
+                   # 수령인은 주문 공통값에 이미 있으므로 상품 기재사항에
+                   # 다시 넣지 않는다. (박남희/박남희 중복 방지)
+                   "기재사항": None, "원문": f"{g(7)} {size} {g(10)}"})
+        if etc_col and g(etc_col):
+            etc_specials, etc_handle, etc_note = _huan_etc_info(g(etc_col))
+            for special in etc_specials:
+                if special not in cur.setdefault("_huan_etc_specials", []):
+                    cur["_huan_etc_specials"].append(special)
+            if etc_handle and not it.get("손잡이길이"):
+                it["손잡이길이"] = etc_handle
+            if etc_note:
+                it["기재사항"] = etc_note
+        hold = holding_product_from_text(it.get("색상원문")) if HOLDING_FEATURE_ENABLED else None
+        if hold:
+            it.update({"제품군": "홀딩도어", "_product_group": "holding",
+                       "_ledger_prefix": "H", "품목코드": hold.get("코드"),
+                       "_holding_product_name": hold["품명"],
+                       "_holding_label": hold.get("장부표시"),
+                       "_holding_operation": normalize_holding_operation(g(10)),
+                       "_holding_upper_roller": "+상하로라" in str(it.get("색상원문") or "").replace(" ", ""),
+                       "손잡이방향": None, "손잡이길이": None,
+                       "타입": "C자", "종류": "투코드"})
         n = g(11)
-        it["창개수"] = int(n) if isinstance(n, (int, float)) and n else 1
-        cur["items"].append(it)
+        try:
+            count = max(1, int(float(n))) if n not in (None, "") else 1
+        except (TypeError, ValueError):
+            count = 1
+        direction_text = str(g(10) or "").strip()
+        directions = re.findall(r"[좌우]", direction_text)
+        if len(directions) == 1 and count > 1:
+            directions *= count
+        elif len(directions) != count:
+            directions = ([directions[0]] * count if directions else [None] * count)
+
+        # 수량 2 + 좌우 -> 좌 1개, 우 1개
+        # 수량 2 + 우우 -> 우 2개처럼 각 창을 개별 품목으로 펼친다.
+        for direction in directions:
+            expanded = dict(it)
+            expanded["손잡이방향"] = direction
+            # 한 창씩 펼친 뒤 원 수량을 다시 보존하면 3창×3=9창이 되므로
+            # 펼쳐진 행은 반드시 수량/창개수 모두 1로 고정한다.
+            expanded["수량"] = 1
+            expanded["창개수"] = 1
+            expanded["좌개수"] = 1 if direction == "좌" else 0
+            expanded["우개수"] = 1 if direction == "우" else 0
+            cur["items"].append(expanded)
+    for order in orders:
+        _apply_huan_message_notes(order)
     return orders
 
 
 # ─────────────────────────────────────────────
 # DI
 # ─────────────────────────────────────────────
-DI_KIND = {"원": "원코드", "투": "투코드", "셔터": "셔터",
+DI_KIND = {"원": "원코드", "투": "투코드", "셔터": "셔터", "심플": "셔터",
            "원코드": "원코드", "투코드": "투코드"}
+
+
+def _di_direct_code(value):
+    """DI 색상 칸의 숫자를 마스터 코드로 정규화한다.
+
+    Excel 숫자 27은 표시 형식의 앞자리 0이 사라지므로 027로 복원한다.
+    P/FP는 품목을 구분하는 코드이므로 버리지 않는다.
+    `NA029FP`, `WH 102 P`, `B027(SV)`처럼 색상 약자·공백·괄호가
+    함께 적힌 표기도 허용한다.
+    """
+    text = re.sub(r"\s+", "", str(value or "").strip().upper())
+    # 끝의 숫자 코드만 읽어 앞의 WH/NA/GR 등 색상 약자는 제외한다.
+    # FP를 P보다 먼저 매칭해 029FP가 029P로 잘리지 않게 한다.
+    m = re.search(r"(\d{1,4})(FP|P)?(?:\([^)]*\))?$", text)
+    if not m:
+        return None
+    d = m.group(1)
+    suffix = m.group(2) or ""
+    return (d.zfill(3) if len(d) <= 3 else d) + suffix
+
+
+def _di_mix_codes(value):
+    """`330(ㅇㄴ)-102(SJ)`처럼 메모가 섞인 한 셀에서 2개 이상 슬랫 코드를 뽑는다."""
+    found = re.findall(r"(?<!\d)(\d{3})(?!\d)", str(value or ""))
+    if len(found) < 2:
+        return None
+    # 같은 코드가 두 번 적힌 것은 그대로 2색 MIX로 보지 않는다.
+    unique = list(dict.fromkeys(found))
+    if len(unique) < 2:
+        return None
+    unique.sort(key=lambda x: (DI_CODE_ORDER.get(x, 10_000), int(x)))
+    return "+".join(unique)
 
 # 헤더 이름 -> 내부 필드 (파일마다 열 위치가 달라 헤더로 찾는다)
 DI_HEAD = {
     "수령인": "recv", "분류": "cls", "원단/색상": "color",
-    "원/투": "kind", "커버/점보": "cover", "사이즈": "size",
+    "원/투": "kind", "L/C": "type", "커버/점보": "cover", "사이즈": "size",
     "줄": "line", "피스": "piece", "비고": "note",
 }
+
+
+def _di_note_fields(value):
+    """DI 비고에서 손잡이 길이와 나머지 특이사항을 분리한다."""
+    text = str(value or "").strip()
+    if not text or text in {"0", "-", "None"}:
+        return None, None
+    m = re.search(r"(?:손잡이(?:길이)?|손|줄|봉)\s*[:=]?\s*(\d{2,3})", text)
+    handle = int(m.group(1)) if m else None
+    if m:
+        text = (text[:m.start()] + " " + text[m.end():]).strip()
+    text = re.sub(r"^[★☆*]+\s*", "", text)
+    text = re.sub(r"[\s,/]+", " ", text).strip(" -–—_=~.·ㆍ")
+    # `긴급 ---`, `긴급 ——`처럼 긴급 뒤에 구분선만 붙은 표기는
+    # 장부/EDI에 불필요한 기호를 남기지 않고 `긴급`만 보존한다.
+    text = re.sub(r"(?<=긴급)\s*[-–—_=~.·ㆍ]+\s*$", "", text).strip()
+    return handle, (text or None)
 
 
 def _di_header(ws):
@@ -158,12 +378,41 @@ def _di_header(ws):
         col, seen = {}, set()
         for i, v in enumerate(vals, 1):
             f = DI_HEAD.get(v)
-            if f and f not in seen:        # 같은 이름이 우측에 또 나오면 무시
+            # 비고가 두 칸이면 앞쪽 비고는 사용하지 않고 뒤쪽 비고만 사용한다.
+            if f == "note":
+                col["note"] = i
+                seen.add(f)
+                continue
+            # 우측 변환 영역의 두 번째 '원단/색상' 열은
+            # `실버 SV 027`, `라임 B720(GN)`처럼 코드가 계산된 결과다.
+            if f == "color" and f in seen and "resolved_color" not in col:
+                col["resolved_color"] = i
+                continue
+            if f and f not in seen:        # 그 밖의 중복 헤더는 첫 열을 사용
                 col[f] = i
                 seen.add(f)
         if "size" in col and "color" in col:
             return r, col
     return None, {}
+
+
+def _propagate_di_urgent(order):
+    """같은 DI 수령인 중 한 행이라도 긴급이면 그 사람의 모든 창에 긴급을 표시한다."""
+    groups = {}
+    for it in order.get("items") or []:
+        recipient = str(it.get("_DIrecipient_context") or it.get("기재사항") or "").strip()
+        groups.setdefault(recipient, []).append(it)
+    for recipient, items in groups.items():
+        urgent = any("긴급" in " ".join(str(it.get(k) or "") for k in
+                         ("_수동특이", "기재사항", "원문")) for it in items)
+        if not urgent:
+            continue
+        for it in items:
+            parts = [x.strip() for x in str(it.get("_수동특이") or "").split("/") if x.strip()]
+            if "긴급" not in parts:
+                parts.append("긴급")
+            it["_수동특이"] = "/".join(parts) or None
+    return order
 
 
 def parse_di(path, sheet="원본"):
@@ -186,27 +435,80 @@ def parse_di(path, sheet="원본"):
         if not m:
             continue
         it = _blank_item()
-        cname = str(g(r, "color") or "").strip()
+        raw_color = g(r, "color")
+        resolved_color = g(r, "resolved_color")
+        cname = str(raw_color or "").strip()
         it["색상원문"] = cname
-        it["품목코드"] = DI_COLOR.get(cname)
-        if cname in DI_COLOR_UNSURE or (cname and not it["품목코드"]):
+        hold = holding_product_from_text(cname) if HOLDING_FEATURE_ENABLED else None
+        # 믹스는 우측 수식의 대표 코드보다 색상표의 정확한 조합을 우선한다.
+        # 홀딩도어는 별도 공식 H 품목표로 매칭한다.
+        mix = None if hold else di_mix_info(cname)
+        raw_mix_codes = None if hold or mix else (
+            _di_mix_codes(raw_color) or _di_mix_codes(resolved_color))
+        if hold:
+            it.update({"제품군": "홀딩도어", "_product_group": "holding",
+                       "_ledger_prefix": "H", "품목코드": hold.get("코드"),
+                       "_holding_product_name": hold["품명"],
+                       "_holding_label": hold.get("장부표시"),
+                       "_holding_upper_roller": "+상하로라" in cname.replace(" ", ""),
+                       "타입": "C자", "종류": "투코드"})
+        elif mix:
+            it["_mix_name"], it["_mix_codes"] = mix
+            it["품목코드"] = mix[1]
+        elif raw_mix_codes:
+            # 이름 없이 코드가 2개 이상이면 MIX로 처리한다. 공식 조합이 코드만으로
+            # 유일하게 식별되면 정식 품명, 아니면 B MIX/B 원코드 MIX를 사용한다.
+            it["_raw_mix_codes"] = raw_mix_codes
+            it["품목코드"] = raw_mix_codes
+        else:
+            normalized_name = normalize_di_color_name(cname)
+            it["품목코드"] = (_di_direct_code(resolved_color)
+                               or _di_direct_code(raw_color)
+                               or DI_COLOR.get(normalized_name))
+        if not hold and (cname in DI_COLOR_UNSURE
+                or (cname and not it["품목코드"])):
             it["확신도"]["품목코드"] = 0.4      # 미등록 색상명 -> 담당자 확인
         # 종류/부속 판정 — 헤더 이름이 파일마다 달라 값으로 판단한다.
         # '원'/'투'/'셔터' 이면 종류, 그 밖의 문구면 커버·점보 등 부속.
         ks = ""
-        for f in ("kind", "cover"):
-            v = str(g(r, f) or "").strip()
-            if not v or v in ("0", "-"):
-                continue
-            if v in DI_KIND:
-                ks = v
+        if not hold:
+            for f in ("kind", "cover"):
+                v = str(g(r, f) or "").strip()
+                if not v or v in ("0", "-"):
+                    continue
+                if v in DI_KIND:
+                    ks = v
+                else:
+                    it["예외품목"] = "부속"
+        if not hold:
+            it["종류"] = DI_KIND.get(ks, "투코드")
+            type_text = str(g(r, "type") or "").strip().upper()
+            it["타입"] = "L자" if type_text.startswith("L") else "C자"
+            # 일반 MIX 단가표는 L18/L21을 별도 품목으로 등록하므로
+            # MIX일 때만 실제 L 규격을 보존한다.
+            if type_text.startswith("L21"):
+                it["_di_mix_family"] = "L21"
+            elif type_text.startswith("L"):
+                it["_di_mix_family"] = "L18"
             else:
-                it["예외품목"] = "부속"
-        it["종류"] = DI_KIND.get(ks, "투코드")
-        it["타입"] = "L자"                       # DI 는 L타입 발주
+                it["_di_mix_family"] = "C자"
+            if it.get("_raw_mix_codes"):
+                official = di_mix_from_codes(it["_raw_mix_codes"])
+                if official:
+                    it["_mix_name"], it["_mix_codes"] = official
+                else:
+                    it["_mix_name"] = "MIX"
+                    it["_mix_codes"] = it["_raw_mix_codes"]
+                    it["_generic_mix"] = True
+                it["품목코드"] = it["_mix_codes"]
+                it.pop("_raw_mix_codes", None)
         it["가로"], it["세로"] = float(m.group(1)), float(m.group(2))
         d = str(g(r, "line") or "").strip()
-        if d.startswith(("좌", "우")):
+        if hold:
+            it["_holding_operation"] = normalize_holding_operation(
+                d if looks_like_holding_operation(d) else None)
+            it["손잡이방향"] = None
+        elif d.startswith(("좌", "우")):
             it["손잡이방향"] = d[0]
             n = re.search(r"(\d+)", d)
             if n:
@@ -214,14 +516,20 @@ def parse_di(path, sheet="원본"):
         recv = str(g(r, "recv") or "").strip()
         note = str(g(r, "note") or "").strip()
         piece = str(g(r, "piece") or "").strip()
-        # DI 장부의 기재사항에는 수령인만 표기한다.
-        # 비고·피스는 원문에만 남겨 필요할 때 확인할 수 있게 한다.
+        note_handle, note_special = _di_note_fields(note)
+        # 비고에 손잡이 길이가 따로 적혀 있으면 그 값이 더 명시적이므로 반영한다.
+        if note_handle is not None:
+            it["손잡이길이"] = note_handle
+        # DI 장부의 기재사항에는 수령인만 표기하고, 비고의 나머지(예: 긴급)는
+        # 특이 칸으로 분리한다. 피스 원문은 확인용으로 보존한다.
         it["기재사항"] = recv if recv and recv != "None" else None
+        it["_수동특이"] = note_special
         it["원문"] = f"{cname} {ks} {size} {d} {note} {piece}".strip()
         o["items"].append(it)
     o["배송"]["방식"] = None                      # DI/SP 출고
     if not o["items"]:
         raise ValueError("DI 발주서에서 유효한 주문 행을 찾지 못했습니다")
+    _propagate_di_urgent(o)
     return o
 
 
@@ -244,7 +552,7 @@ def _unit_directions(text, qty):
 
 
 def _unit_code(value):
-    m = re.search(r"(?<!\d)(\d{3}[A-Za-z]*)(?!\d)", str(value or ""))
+    m = re.search(r"(?<!\d)(\d{3,4}[A-Za-z]*)(?!\d)", str(value or ""))
     return m.group(1) if m else None
 
 
@@ -290,15 +598,33 @@ def parse_unitns(path):
                     dirs = _unit_directions(ws.cell(rr, 6).value, qty)
                     product = str(ws.cell(rr, 2).value or "")
                     item_note = str(ws.cell(rr, 8).value or "").strip()
+                    row_text = " ".join(str(ws.cell(rr, c).value or "") for c in range(2, 9))
+                    hm = re.search(r"(?:손잡이(?:길이)?|손|줄|봉|각도봉)\s*[:=]?\s*(\d{2,3})", row_text)
+                    handle_len = int(hm.group(1)) if hm else None
                     screw = None
-                    if "콘크리트" in item_note:
-                        screw = "콘크리트"
+                    accessory_name = None
+                    note_key = item_note.replace(" ", "")
+                    if "노피스" in note_key:
+                        nm = re.search(r"노피스[^0-9]*(2|3)", note_key)
+                        n = nm.group(1) if nm else None
+                        screw = f"노피스({n})" if n else "노피스"
+                        accessory_name = f"노피스브라켓({n}EA)" if n in {"2", "3"} else "노피스"
+                    elif "콘크리트" in item_note:
+                        screw, accessory_name = "콘크리트", "피스(콘크리트)"
+                    elif "석고날개" in note_key or "칼블럭" in note_key:
+                        # 석고칼블럭-날개 = 석고날개 (2026-09-14 사용자 확정)
+                        screw, accessory_name = "석고날개", "피스(석고날개)"
+                    elif "석고앙카" in note_key or "석고용앙카" in note_key:
+                        screw, accessory_name = "석고앙카", "피스(석고앙카)"
                     elif "석고" in item_note:
-                        screw = "석고"
+                        # '석고'만 적힌 경우는 석고앙카로 본다(2026-09-14 사용자 확정). 특이 칸은 원문대로 `석고`.
+                        screw, accessory_name = "석고", "피스(석고앙카)"
+                    elif "직결" in item_note or "시공" in item_note:
+                        screw, accessory_name = "직결", "피스(시공/직결)"
                     if screw:
                         screw_count = 2 if float(w) < 150 else (3 if float(w) < 200 else 4)
                         o["_unit_accessories"].append({
-                            "품명": f"{screw}({screw_count})", "세트": qty,
+                            "품명": accessory_name, "세트": qty, "피스수": screw_count,
                         })
                     type_ = "L자" if re.search(r"L\s*(?:자|형|타입|18|21)", product, re.I) else "C자"
                     for direction in dirs:
@@ -307,7 +633,9 @@ def parse_unitns(path):
                                    "타입": type_, "종류": "투코드",
                                    "가로": float(w), "세로": float(h),
                                    "손잡이방향": direction,
+                                   "손잡이길이": handle_len,
                                    "기재사항": None,
+                                   "_수동특이": screw,
                                    "원문": " ".join(str(ws.cell(rr, c).value or "")
                                                       for c in range(2, 9)).strip()})
                         o["items"].append(it)
@@ -337,7 +665,7 @@ def _product_parts(product, color, operation):
     text = " ".join(str(x or "") for x in (product, color, operation))
     code = _unit_code(color) or _unit_code(text)
     type_ = "L자" if re.search(r"L\s*(?:자|형|타입|18|21)|알루미늄L", text, re.I) else "C자"
-    if "셔터" in text:
+    if "셔터" in text or "심플" in text:    # 심플 = 셔터
         kind = "셔터"
     elif "원코드" in text:
         kind = "원코드"
@@ -355,26 +683,45 @@ def _direction(value):
     return None
 
 
-def _freight_info(value):
-    """'안산초지점/착불/받는사람:보노(010...)'을 배송 정보로 분리."""
+def _bono_freight_info(value, explicit_address=None, self_names=("보노",)):
+    """보노의 화물지점/받는사람을 장부 기재사항과 배송정보로 분리한다.
+
+    받는사람이 보노면 기재사항1은 대신화물 지점명(끝의 '점'만 제거),
+    보노가 아니면 실제 받는사람/상호를 사용한다.
+    """
     s = str(value or "").strip()
-    if not s:
-        return "화물", None, None
     if "택배" in s:
         method = "택배"
     elif "배달" in s:
         method = "배달"
     else:
         method = "화물"
-    first = s.split("/")[0].strip().replace("점", "")
-    m = re.search(r"받는\s*사람\s*:\s*([^/(]+)?\s*\(?\s*(01\d[-\d]+)", s)
-    receiver = (m.group(1).strip() if m and m.group(1) else "")
-    phone = m.group(2).strip() if m else ""
-    address = "-".join(x for x in (first, receiver) if x)
-    if phone:
-        address = f"{address} {phone}".strip()
+    parts = [x.strip() for x in s.split("/") if x.strip()]
+    branch_raw = parts[0] if parts else ""
+    branch = re.sub(r"점\s*$", "", branch_raw).strip()
     pay = "선불" if "선불" in s else ("착불" if "착불" in s else None)
-    return method, address or None, pay
+
+    receiver = ""
+    phone = ""
+    m = re.search(r"받는\s*사람\s*:\s*(.*)", s)
+    if m:
+        tail = m.group(1).strip()
+        pm = re.search(r"(01\d[-\d]{7,})", tail)
+        if pm:
+            phone = pm.group(1).strip()
+            receiver = tail[:pm.start()].strip(" ()/-")
+        else:
+            receiver = tail.strip(" ()/-")
+    receiver = re.sub(r"\s+", " ", receiver).strip()
+    compact_receiver = re.sub(r"\s+", "", receiver) if receiver else ""
+    is_bono = any(str(name).replace(" ", "") in compact_receiver for name in self_names) if compact_receiver else False
+    note1 = branch if is_bono else (receiver or branch)
+
+    address = str(explicit_address or "").strip()
+    if not address:
+        # 구형 보노 파일에는 별도 도로명 주소 열이 없어서 화물지점-수령인 형태가 주소 역할을 했다.
+        address = "-".join(x for x in (branch, receiver) if x)
+    return method, address or None, pay, receiver or None, phone or None, branch or None, note1 or None, is_bono
 
 
 def _sender_text(value, default="보노 010-2478-9290"):
@@ -387,13 +734,14 @@ def _sender_text(value, default="보노 010-2478-9290"):
 
 
 def _finish_excel_order(order):
+    """보노/미래가공 Excel 주문 마무리.
+
+    여러 창이라는 이유만으로 원코드를 연창으로 추정하지 않는다.
+    연창은 발주서에 명시적인 근거가 있거나 사용자가 사전점검에서 직접 지정한 경우에만 유지한다.
+    """
     if not order:
         return None
     items = order.get("items") or []
-    if len(items) > 1:
-        for it in items:
-            if it.get("종류") == "원코드":
-                it["연창"] = True
     return order if items else None
 
 
@@ -404,6 +752,9 @@ def parse_bono(path):
     if not col:
         wb.close()
         raise ValueError("보노 발주서 헤더를 찾지 못했습니다")
+
+    # 새 양식에 주소 열이 추가돼도 헤더명에 '주소'가 포함되면 그대로 사용한다.
+    address_col = next((c for h, c in col.items() if "주소" in str(h)), None)
     orders, cur = [], None
     for r in range(hr + 1, ws.max_row + 1):
         product = ws.cell(r, col["품명"]).value
@@ -413,19 +764,24 @@ def parse_bono(path):
         h = ws.cell(r, size_col + 1).value if size_col else None
         if not (product and isinstance(w, (int, float)) and isinstance(h, (int, float))):
             continue
-        order_no = str(ws.cell(r, col["오더명"]).value or "").strip()
+        order_no = str(ws.cell(r, col["오더명"]).value or "").replace("\n", "").strip()
         if order_no:
             done = _finish_excel_order(cur)
             if done:
                 orders.append(done)
             cur = _shell("보노")
-            cur["주문번호"] = order_no.replace("\n", "")
+            cur["주문번호"] = order_no
             d = ws.cell(r, col["출고일"]).value if "출고일" in col else None
             if hasattr(d, "date"):
                 cur["_ship_date"] = d.date().isoformat()
-            method, address, pay = _freight_info(
-                ws.cell(r, col["거래처(화물지점)"]).value)
-            cur["배송"].update({"방식": method, "주소": address,
+            explicit_address = ws.cell(r, address_col).value if address_col else None
+            (method, address, pay, receiver, phone, branch, note1, is_bono) = \
+                _bono_freight_info(ws.cell(r, col["거래처(화물지점)"]).value, explicit_address)
+            cur["_bono_note1"] = note1
+            cur["_bono_branch"] = branch
+            cur["_bono_receiver_is_bono"] = bool(is_bono)
+            cur["배송"].update({"방식": method, "주소": address, "화물지점": branch,
+                                "수령인": receiver, "연락처": phone,
                                 "선불착불": pay, "발신": "보노 010-2478-9290"})
         if cur is None:
             continue
@@ -441,6 +797,7 @@ def parse_bono(path):
                    "손잡이길이": ws.cell(r, col.get("길이", 0)).value
                                   if col.get("길이") else None,
                    "설치장소": str(ws.cell(r, col.get("시공위치", 0)).value or "").strip() or None,
+                   "작동방식필증": str(operation or "").strip() or None,
                    "원문": " ".join(str(ws.cell(r, c).value or "")
                                       for c in range(1, ws.max_column + 1)).strip()})
         cur["items"].append(it)
@@ -451,7 +808,6 @@ def parse_bono(path):
     if not orders:
         raise ValueError("보노 발주서에서 유효한 주문을 찾지 못했습니다")
     return orders
-
 
 def parse_future(path):
     wb = openpyxl.load_workbook(path, data_only=True)
@@ -484,13 +840,20 @@ def parse_future(path):
                        "손잡이길이": ws.cell(r, col.get("줄길이", 0)).value
                                       if col.get("줄길이") else None,
                        "설치장소": str(ws.cell(r, col.get("비고", 0)).value or "").strip() or None,
+                       "작동방식필증": str(operation or "").strip() or None,
                        "원문": " ".join(str(ws.cell(r, c).value or "")
                                           for c in range(1, ws.max_column + 1)).strip()})
             cur["items"].append(it)
         elif cur and "발신" in str(ws.cell(r, col["고객명"]).value or ""):
-            sender = _sender_text(ws.cell(r, col["고객명"]).value)
-            method, address, pay = _freight_info(ws.cell(r, col["태영품명"]).value)
-            cur["배송"].update({"방식": method, "주소": address,
+            sender = _sender_text(ws.cell(r, col["고객명"]).value, default="미래가공")
+            (method, address, pay, receiver, phone, branch, note1, is_self) = \
+                _bono_freight_info(ws.cell(r, col["태영품명"]).value,
+                                   self_names=("미래가공", "미래", "보노"))
+            cur["_bono_note1"] = note1
+            cur["_bono_branch"] = branch
+            cur["_bono_receiver_is_bono"] = bool(is_self)
+            cur["배송"].update({"방식": method, "주소": address, "화물지점": branch,
+                                "수령인": receiver, "연락처": phone,
                                 "선불착불": pay, "발신": sender})
     wb.close()
     done = _finish_excel_order(cur)
@@ -500,6 +863,88 @@ def parse_future(path):
 
 
 # ─────────────────────────────────────────────
+def _legacy_xls_to_xlsx(path):
+    """Excel 97-2003 .xls를 임시 .xlsx로 변환한다.
+
+    기존 업체별 파서는 openpyxl 기반이므로, 진짜 BIFF .xls는 xlrd로 값/병합을 읽어
+    임시 xlsx에 복사한 뒤 기존 파서를 그대로 통과시킨다. 원본 파일은 수정하지 않는다.
+    """
+    try:
+        import xlrd
+    except ImportError as e:
+        raise RuntimeError(
+            "구형 .xls 발주서를 읽는 모듈(xlrd)이 없습니다. install_FitOrder.bat을 한 번 실행해 주세요."
+        ) from e
+
+    path = Path(path)
+    try:
+        book = xlrd.open_workbook(str(path), formatting_info=False)
+    except Exception as exc:
+        raise ValueError(
+            f"구형 .xls 파일을 읽지 못했습니다. 파일이 실제 Excel 97-2003 형식인지 확인해 주세요. ({type(exc).__name__}: {exc})"
+        ) from exc
+
+    wb = openpyxl.Workbook()
+    # 기본 시트는 실제 첫 시트 생성 시 재사용한다.
+    default = wb.active
+    default.title = "Sheet1"
+    first = True
+    for xs in book.sheets():
+        if first:
+            ws = default
+            ws.title = (xs.name or "Sheet1")[:31]
+            first = False
+        else:
+            # Excel 시트명 제한/중복을 openpyxl이 처리하도록 약간 보정한다.
+            title = (xs.name or f"Sheet{len(wb.worksheets)+1}")[:31]
+            base = title
+            n = 2
+            while title in wb.sheetnames:
+                suffix = f"_{n}"
+                title = (base[:31-len(suffix)] + suffix)
+                n += 1
+            ws = wb.create_sheet(title)
+
+        for r in range(xs.nrows):
+            for c in range(xs.ncols):
+                cell = xs.cell(r, c)
+                value = cell.value
+                if cell.ctype == xlrd.XL_CELL_DATE:
+                    try:
+                        value = xlrd.xldate_as_datetime(value, book.datemode)
+                    except Exception:
+                        pass
+                elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
+                    value = bool(value)
+                elif cell.ctype == xlrd.XL_CELL_NUMBER:
+                    try:
+                        f = float(value)
+                        value = int(f) if f.is_integer() else f
+                    except Exception:
+                        pass
+                elif cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+                    value = None
+                elif cell.ctype == xlrd.XL_CELL_ERROR:
+                    value = None
+                ws.cell(r + 1, c + 1).value = value
+
+        # 병합 범위는 파싱 헤더/주소 구조에 영향을 줄 수 있으므로 가능하면 보존한다.
+        try:
+            for rlo, rhi, clo, chi in xs.merged_cells:
+                if rhi > rlo and chi > clo:
+                    ws.merge_cells(start_row=rlo + 1, end_row=rhi,
+                                   start_column=clo + 1, end_column=chi)
+        except Exception:
+            pass
+
+    tmp = tempfile.NamedTemporaryFile(prefix="fitorder_xls_", suffix=".xlsx", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    wb.save(tmp_path)
+    wb.close()
+    return tmp_path
+
+
 def detect_excel_client(path):
     """파일명이 아닌 실제 시트/헤더로 DI·휴안·유앤을 구분한다."""
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
@@ -533,18 +978,31 @@ def detect_excel_client(path):
 
 
 def parse_excel(path, client=None):
-    client = client or detect_excel_client(path)
-    if client == "휴안":
-        return parse_huan(path)
-    if client == "DI":
-        return [parse_di(path)]
-    if client == "유앤":
-        return parse_unitns(path)
-    if client == "보노":
-        return parse_bono(path)
-    if client == "미래가공":
-        return parse_future(path)
-    raise ValueError(f"엑셀 파서 없음: {client}")
+    original = Path(path)
+    temp_path = None
+    work_path = original
+    if original.suffix.lower() == ".xls":
+        temp_path = _legacy_xls_to_xlsx(original)
+        work_path = temp_path
+    try:
+        client = client or detect_excel_client(work_path)
+        if client == "휴안":
+            return parse_huan(work_path)
+        if client == "DI":
+            return [parse_di(work_path)]
+        if client == "유앤":
+            return parse_unitns(work_path)
+        if client == "보노":
+            return parse_bono(work_path)
+        if client == "미래가공":
+            return parse_future(work_path)
+        raise ValueError(f"엑셀 파서 없음: {client}")
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

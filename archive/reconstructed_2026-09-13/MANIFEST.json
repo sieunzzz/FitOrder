@@ -1,0 +1,14 @@
+{
+  "name": "FitOrder Claude Ready",
+  "generated": "2026-09-13",
+  "status": "reconstructed editable project",
+  "verified_legacy_sources": [
+    "FitOrder_v82_qt_app.py",
+    "FitOrder_v79_output.py",
+    "FitOrder_clipboard_watch.py",
+    "README v84 history"
+  ],
+  "entrypoint": "run_fitorder.py",
+  "rules": "docs/RULES_MASTER.md",
+  "master": "data/master/fitorder_master.json"
+}

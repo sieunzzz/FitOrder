@@ -1,0 +1,10 @@
+[project]
+name = "fitorder"
+version = "2026.09.06-108"
+requires-python = ">=3.10"
+# 실행 의존성은 support/requirements.txt (install_FitOrder.bat → setup_fitorder.py) 를 따른다.
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"

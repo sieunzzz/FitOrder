@@ -1,0 +1,21 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+out/*
+!out/.gitkeep
+db/
+.fitorder_last_ledger.txt
+.fitorder_python.txt
+src/_cache/
+private_data/
+*.log
+# 로컬 백업 (코드 이력은 Git이 보관)
+FitOrder_backup_*.zip
+fitorder_master_backup_*.xlsx
+.pytest_cache/
+# 거래처 단가가 들어 있는 자료는 공개 저장소에 올리지 않는다(PC에는 그대로 둠)
+*.xls
+*.xlsx
+tests/golden/
+archive/**/golden/

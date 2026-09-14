@@ -1,0 +1,45 @@
+FitOrder v100 구조
+=================
+
+1. 제품군 UI
+- 시작화면: 블라인드 / 롤·콤비 / 홀딩도어
+- 세 화면 모두 `OrderWorkspace(product_mode)` 공통 UI를 사용한다.
+- 주문 데이터는 각 Workspace가 독립적으로 보관하므로 제품군 간 화면 상태를 공유하지 않는다.
+
+2. 공통 품목장 계층
+- `src/master_loader.py`
+  - .xlsx / .xls 공통 읽기
+  - 컬럼 번호가 아니라 헤더명으로 데이터 읽기
+  - 외부 `data/master` 우선, SRC 폴백 지원
+- `src/master_registry.py`
+  - 제품군별 마스터 생성/캐시
+  - 블라인드와 홀딩은 같은 기본 거래처/EDI Master 객체를 공유
+  - 롤·콤비는 RollComboMaster를 별도 유지
+
+3. 품목장 위치
+- 블라인드: `data/master/fitorder_master.xlsx`
+- 롤·콤비: `data/master/roll_combo/*.xls|*.xlsx`
+- 홀딩도어: `data/master/holding/holding_master.xlsx`
+
+SRC 폴더만 교체하는 환경을 위한 폴백:
+- 롤·콤비: `src/roll_combo_master/`
+- 홀딩도어: `src/holding_master/holding_master.xlsx`
+
+4. 제품군별 규칙
+- 블라인드: `rules.py`, `parsers.py`, `extract.py`
+- 롤·콤비: `roll_combo.py`
+- 홀딩도어: `holding.py`
+
+품목/단가는 품목장에서 읽고, 계산·표기·배송·기재사항 등의 업무 규칙은 코드에 둔다.
+
+5. 출력
+- `output.py`가 장부 / 작업지시서 / 경영박사 EDI를 생성한다.
+- 한 출력 배치에 서로 다른 product_mode가 섞이면 v100부터 오류로 차단한다.
+
+6. v100 안전성 보완
+- 홀딩도어 품목 데이터를 holding.py 하드코딩에서 외부 품목장으로 이동.
+- 홀딩 모드에서 B117처럼 OCR된 홀딩 코드는 H117로 복원.
+- 홀딩 품목장에 없는 B102 같은 블라인드 코드는 정상 홀딩 제품으로 출력하지 않고 `[홀딩 품목확인]`으로 표시.
+- 블라인드/홀딩 기본 Master 중복 로딩 제거.
+- 품목장 컬럼 순서 변경에 덜 취약하도록 헤더 기반 로딩.
+- 제품군 혼합 출력 차단.

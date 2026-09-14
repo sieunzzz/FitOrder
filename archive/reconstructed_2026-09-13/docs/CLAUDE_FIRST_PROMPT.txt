@@ -1,0 +1,12 @@
+이 폴더는 FitOrder 프로젝트야. 먼저 CLAUDE.md, docs/PROJECT_CONTEXT.md, docs/RULES_MASTER.md, docs/RECOVERY_STATUS.md를 읽고 전체 구조를 요약해줘.
+
+그 다음:
+1) 현재 코드에서 문서 규칙 대비 미구현/부분구현된 부분을 표로 정리하고,
+2) 원본 구조(qt_app → desktop_workflow → rules/output/holding)를 유지하면서,
+3) 업체별 parser / 출력 / UI / 테스트를 단계적으로 정리할 리팩터링 계획을 만들어줘.
+
+중요:
+- 규칙을 임의로 단순화하거나 삭제하지 말 것.
+- 기존 데이터 schema를 먼저 안정화할 것.
+- 실제 고객 개인정보/API 키는 코드에 넣지 말 것.
+- 수정 전 테스트 케이스부터 추가할 것.

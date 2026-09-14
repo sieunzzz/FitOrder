@@ -1,0 +1,9 @@
+streamlit>=1.40
+pandas>=2.2
+openpyxl>=3.1
+Pillow>=10.0
+openai>=1.40
+python-dotenv>=1.0
+PyMuPDF>=1.24
+pytest>=8.0
+# xlrd / xlwt 는 원본 배포와 같이 src/xlrd, src/xlwt 에 포함되어 있다.

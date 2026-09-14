@@ -6,13 +6,41 @@ strict 모드 제약:
   - 모든 property 를 required 에 포함 (선택 항목은 ["string","null"] 로)
 """
 
-CLIENTS = ["DI", "휴안", "M", "DU", "RT", "JO", "JL", "SP",
-           "유앤", "아지트", "WT", "인천)트루", "미래가공", "보노", "MS"]
+CLIENTS = ["DI", "SP", "휴안", "M", "DU", "RT", "JO", "JL", "DD",
+           "유앤", "아지트", "WT", "인천)트루", "미래가공", "보노", "MS",
+           "구미)경남", "창문애", "한길"]
 
 _ITEM = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
+        "제품군": {
+            "type": "string",
+            "enum": ["블라인드"],
+            "description": "현재 홀딩도어 자동 판별은 사용하지 않는다. 모든 제작 주문은 블라인드로 추출",
+        },
+        "홀딩방식": {
+            "type": ["string", "null"],
+            "description": "현재 사용하지 않음. 반드시 null",
+        },
+        "홀딩레일": {
+            "type": ["string", "null"],
+            "description": "현재 사용하지 않음. 반드시 null",
+        },
+        "홀딩상하로라": {
+            "type": "boolean",
+            "description": "현재 사용하지 않음. 반드시 false",
+        },
+        "홀딩부속": {
+            "type": ["string", "null"],
+            "enum": ["레일연결부속", "라운드부속", None],
+            "description": "현재 사용하지 않음. 반드시 null",
+        },
+        "홀딩부속색상": {
+            "type": ["string", "null"],
+            "enum": ["화이트", "블랙", None],
+            "description": "현재 사용하지 않음. 반드시 null",
+        },
         "품목코드": {
             "type": ["string", "null"],
             "description": "슬랫 색상 번호. 'WH102'→'102', 'IV200'→'200', "
@@ -44,7 +72,7 @@ _ITEM = {
         "손잡이방향": {
             "type": ["string", "null"],
             "enum": ["좌", "우", None],
-            "description": "발주서에 '좌'/'우' 표기. 좌|우 두 열이면 숫자가 적힌 열을 방향으로 읽음. 없으면 null",
+            "description": "발주서에 단일 '좌'/'우' 표기. 한 치수에 좌/우가 둘 다 있으면 이 필드는 null로 두고 좌개수/우개수/창개수로 표현",
         },
         "손잡이길이": {
             "type": ["integer", "null"],
@@ -61,12 +89,12 @@ _ITEM = {
         },
         "예외품목": {
             "type": ["string", "null"],
-            "enum": ["수리", "롤스크린", "홀딩도어", "BMIX", "부속", "레일", None],
-            "description": "해당하면 명칭, 아니면 null",
+            "enum": ["수리", "롤스크린", "BMIX", "부속", "레일", None],
+            "description": "일반 블라인드의 예외품목만. 홀딩도어/홀딩 전용 부속은 예외품목이 아님",
         },
         "창개수": {
             "type": ["integer", "null"],
-            "description": "표의 수량 열 값. 그 치수의 창이 몇 개인지. 열이 없으면 null",
+            "description": "표의 수량 열 값 또는 한 치수에 적힌 방향 개수. 예: '77*88 좌 우' -> 창개수 2",
         },
         "좌개수": {
             "type": ["integer", "null"],
@@ -90,6 +118,7 @@ _ITEM = {
         },
     },
     "required": [
+        "제품군", "홀딩방식", "홀딩레일", "홀딩상하로라", "홀딩부속", "홀딩부속색상",
         "품목코드", "색상원문", "타입", "종류", "가로", "세로", "수량",
         "손잡이방향", "손잡이길이", "연창", "설치장소", "기재사항",
         "예외품목", "창개수", "좌개수", "우개수", "원문", "확신도",
@@ -127,7 +156,7 @@ EXTRACTION_SCHEMA = {
         "발주일": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
         "주문번호": {
             "type": ["string", "null"],
-            "description": "SP의 주문일자-주문번호. 예: 17-9. SP가 아니면 null",
+            "description": "거래처 주문번호. 표기가 없으면 null",
         },
         "고객명": {"type": ["string", "null"], "description": "발주서 상단 '고객명' 값"},
         "items": {"type": "array", "items": _ITEM},
@@ -139,7 +168,7 @@ EXTRACTION_SCHEMA = {
         "전체기재사항": {
             "type": ["string", "null"],
             "description": "표 하단 비고의 공통 지시와 주문번호. "
-                           "'피스 동봉해주세요'→'피스', '( 기재 : 임지애 DW )'→'임지애DW', "
+                           "'피스 동봉해주세요'→'피스', '( 기재 : 임지애 DW )'→JL은 '임지애'(DW 제거), "
                            "'주문 번 호 : 226095'→'226095'. 여러 개면 / 로 연결. "
                            "포장 관련 지시(비닐포장·걷비닐)는 제외",
         },

@@ -28,6 +28,9 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from extract_schema import RESPONSE_FORMAT
 from prompt import SYSTEM_PROMPT, user_prompt
+from holding import (HOLDING_FEATURE_ENABLED, holding_accessory_from_text, holding_product_from_text,
+                     looks_like_holding_operation, normalize_holding_operation)
+from rules import apply_delivery_policy
 
 # 저렴한 비전 모델부터 시작. 정확도가 부족하면 상위 모델로 교체.
 MODEL = os.getenv("FITORDER_MODEL", "gpt-4o")
@@ -182,7 +185,10 @@ def _merge_sp_orders(page_orders):
                     if part and part not in vals:
                         vals.append(part)
             dst[field] = "/".join(vals) or None
-    return [merged[k] for k in order_keys]
+    result = [merged[k] for k in order_keys]
+    for order in result:
+        apply_delivery_policy(order)
+    return result
 
 
 def diagnose():
@@ -235,6 +241,406 @@ def _encode(path: str) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def _encode_jo_table_crop(path: str) -> str:
+    """제이원 표의 작은 수량/좌/우 숫자를 확대해 같은 호출에 보조 이미지로 전달한다."""
+    img = Image.open(path)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    w, h = img.size
+    # 제이원 주문서의 품목 표는 보통 하단에 있다. 좌우 여백도 조금 제거한다.
+    y0 = int(h * 0.43)
+    x0, x1 = int(w * 0.015), int(w * 0.985)
+    crop = img.crop((x0, y0, x1, h))
+    # 표 선/작은 숫자 대비를 살리되 색상은 유지한다.
+    if crop.mode == "RGB":
+        crop = ImageOps.autocontrast(crop, cutoff=0.5)
+    long_side = max(crop.size)
+    if long_side < 2200:
+        k = 2200 / long_side
+        crop = crop.resize((int(crop.width * k), int(crop.height * k)), Image.LANCZOS)
+    elif long_side > 2600:
+        k = 2600 / long_side
+        crop = crop.resize((int(crop.width * k), int(crop.height * k)), Image.LANCZOS)
+    buf = io.BytesIO()
+    crop.save(buf, format="PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _clean_jo_note(value):
+    """제이원 장부 기재사항에서는 손/줄/봉 길이 표기를 제거한다."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = re.sub(r"(?:손잡이(?:길이)?|손|줄|봉)\s*[:=]?\s*\d{2,3}", " ", text)
+    text = re.sub(r"\s*[/|,]+\s*", "/", text)
+    text = re.sub(r"/{2,}", "/", text).strip(" /,.-")
+    return text or None
+
+
+def _postprocess_jo(data):
+    """제이원 주문번호/표 수량/좌우/메모를 결정 규칙으로 한 번 더 고정한다."""
+    whole = str(data.get("전체원문") or "")
+    raw_no = str(data.get("주문번호") or "").strip()
+    if not raw_no:
+        m = re.search(r"주문\s*번\s*호\s*[:：]?\s*([A-Za-z0-9-]+)", whole)
+        if m:
+            raw_no = m.group(1).strip()
+    data["주문번호"] = raw_no or None
+
+    # 전체기재사항에는 주문번호를 중복 보관하지 않는다. 장부 기재사항1은 주문번호 필드에서 만든다.
+    common = []
+    for part in str(data.get("전체기재사항") or "").split("/"):
+        part = _clean_jo_note(part)
+        if not part:
+            continue
+        if raw_no and re.sub(r"[()（）\s]", "", part) == re.sub(r"[()（）\s]", "", raw_no):
+            continue
+        if part not in common:
+            common.append(part)
+    data["전체기재사항"] = "/".join(common) or None
+
+    for item in data.get("items") or []:
+        raw = " ".join(str(item.get(k) or "") for k in ("원문", "기재사항"))
+        if item.get("손잡이길이") in (None, ""):
+            hm = re.search(r"(?:손잡이(?:길이)?|손|줄|봉)\s*[:=]?\s*(\d{2,3})", raw)
+            if hm:
+                item["손잡이길이"] = int(hm.group(1))
+        item["기재사항"] = _clean_jo_note(item.get("기재사항"))
+
+        try:
+            left_n = int(float(item.get("좌개수") or 0))
+            right_n = int(float(item.get("우개수") or 0))
+        except (TypeError, ValueError):
+            left_n = right_n = 0
+        total_lr = left_n + right_n
+        try:
+            count = int(float(item.get("창개수"))) if item.get("창개수") not in (None, "") else 0
+        except (TypeError, ValueError):
+            count = 0
+        if count <= 0 and total_lr > 0:
+            item["창개수"] = total_lr
+            count = total_lr
+        if left_n > 0 and right_n == 0:
+            item["손잡이방향"] = "좌"
+        elif right_n > 0 and left_n == 0:
+            item["손잡이방향"] = "우"
+    return data
+
+
+def _normalize_holding_item(item):
+    """모델의 홀딩도어 필드를 공식 품목/내부 필드로 정규화한다."""
+    if not HOLDING_FEATURE_ENABLED:
+        # 홀딩 자동 판별을 사용하지 않는 동안에는 어떤 H/홀딩/자바라 표기도
+        # 별도 제품군으로 바꾸지 않는다. 원래 읽은 일반 주문 필드를 유지한다.
+        item["제품군"] = "블라인드"
+        item["홀딩방식"] = None
+        item["홀딩레일"] = None
+        item["홀딩상하로라"] = False
+        item["홀딩부속"] = None
+        item["홀딩부속색상"] = None
+        exc = str(item.get("예외품목") or "").strip()
+        if exc and ("홀딩" in exc or "자바라" in exc):
+            item["예외품목"] = None
+        item.pop("_product_group", None)
+        item.pop("_ledger_prefix", None)
+        for key in list(item):
+            if key.startswith("_holding_"):
+                item.pop(key, None)
+        return item
+    raw = " ".join(str(item.get(k) or "") for k in
+                   ("색상원문", "품목코드", "원문", "홀딩부속"))
+    accessory_name = item.get("홀딩부속")
+    accessory = None
+    if accessory_name:
+        accessory = holding_accessory_from_text(
+            f"{accessory_name} {item.get('홀딩부속색상') or '화이트'}",
+            item.get("홀딩부속색상") or "화이트")
+    if not accessory:
+        accessory = holding_accessory_from_text(raw,
+                                                item.get("홀딩부속색상") or "화이트")
+    product = None if accessory else (holding_product_from_text(item.get("색상원문"))
+                                      or holding_product_from_text(item.get("품목코드"))
+                                      or holding_product_from_text(raw))
+    explicit = item.get("제품군") == "홀딩도어" or bool(accessory_name)
+    if not explicit and not accessory and not product:
+        return item
+
+    item["_product_group"] = "holding"
+    item["_ledger_prefix"] = "H"
+    item["예외품목"] = None
+    item["타입"], item["종류"] = "C자", "투코드"
+    item["손잡이방향"] = None
+    item["손잡이길이"] = None
+    item["연창"] = False
+
+    if accessory:
+        item["_holding_accessory"] = True
+        item["_holding_product_name"] = accessory["품명"]
+        item["_holding_accessory_label"] = accessory.get("장부표시")
+        item["_holding_accessory_color"] = accessory.get("부속색상") or "화이트"
+        item["품목코드"] = accessory.get("코드")
+        # 부속 개수는 structured output의 창개수 또는 수량을 그대로 사용한다.
+        return item
+
+    item.pop("_holding_accessory", None)
+    if product:
+        item["_holding_product_name"] = product["품명"]
+        item["_holding_label"] = product.get("장부표시")
+        item["품목코드"] = product.get("코드")
+    operation = item.get("홀딩방식")
+    if not operation and looks_like_holding_operation(item.get("수량")):
+        operation = item.get("수량")
+        item["수량"] = None
+    item["_holding_operation"] = normalize_holding_operation(operation)
+    item["_holding_rail"] = str(item.get("홀딩레일") or "").strip() or None
+    item["_holding_upper_roller"] = bool(item.get("홀딩상하로라")) or \
+        "+상하로라" in raw.replace(" ", "")
+    return item
+
+
+def _postprocess_direction_sequence(data):
+    """한 치수 뒤에 `좌 우`, `좌,우,우`처럼 방향이 여러 개면 실제 창 수로 복원한다."""
+    for item in data.get("items") or []:
+        raw = str(item.get("원문") or "")
+        if not re.search(r"\d+(?:\.\d+)?\s*[xX×*]\s*\d+(?:\.\d+)?", raw):
+            continue
+        # 치수 뒤쪽만 본다. 주소/방이름에 들어간 글자는 방향으로 세지 않는다.
+        m = re.search(r"\d+(?:\.\d+)?\s*[xX×*]\s*\d+(?:\.\d+)?(.*)$", raw)
+        tail = m.group(1) if m else ""
+        dirs = re.findall(r"[좌우]", tail)
+        if len(dirs) < 2:
+            continue
+        item["창개수"] = len(dirs)
+        item["좌개수"] = dirs.count("좌")
+        item["우개수"] = dirs.count("우")
+        item["손잡이방향"] = None
+    return data
+
+
+def _postprocess_azit(data):
+    """아지트 카톡의 쉼표 치수/방향 축약을 원문 순서대로 실제 창 단위로 복원한다."""
+    whole = str(data.get("전체원문") or "").strip()
+    if not whole:
+        whole = "\n".join(str(x.get("원문") or "").strip() for x in (data.get("items") or [])
+                           if str(x.get("원문") or "").strip())
+    if not whole:
+        return data
+
+    lines = [re.sub(r"\s+", " ", x).strip() for x in whole.splitlines() if x.strip()]
+    existing = list(data.get("items") or [])
+    rebuilt = []
+
+    def nval(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def template_for(w, h):
+        for it in existing:
+            iw, ih = nval(it.get("가로")), nval(it.get("세로"))
+            if iw is not None and ih is not None and abs(iw-w) < 0.001 and abs(ih-h) < 0.001:
+                return dict(it)
+        return dict(existing[0]) if existing else {}
+
+    def extra_tail(i, tail):
+        # 다음 줄이 또 제품 치수가 아니면 제품 옵션 줄로 한 줄만 이어 붙인다.
+        if i + 1 < len(lines) and not re.search(r"\d+(?:\.\d+)?(?:\s*,\s*\d+(?:\.\d+)?)*\s*[xX×*]\s*\d+(?:\.\d+)?", lines[i+1]):
+            return (tail + " " + lines[i+1]).strip()
+        return tail.strip()
+
+    for i, line in enumerate(lines):
+        multi = re.search(r"([^\d\n]{1,60}?)(\d+(?:\.\d+)?(?:\s*,\s*\d+(?:\.\d+)?)+)\s*[xX×*]\s*(\d+(?:\.\d+)?)(.*)$", line)
+        single = None if multi else re.search(r"([^\d\n]{1,60}?)(\d+(?:\.\d+)?)\s*[xX×*]\s*(\d+(?:\.\d+)?)(.*)$", line)
+        if not multi and not single:
+            continue
+
+        m = multi or single
+        prefix = m.group(1).strip(" /,:-")
+        room_m = re.search(r"([가-힣A-Za-z][가-힣A-Za-z0-9_-]{0,24})$", prefix)
+        room = room_m.group(1) if room_m else (prefix or None)
+        widths = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", m.group(2))]
+        height = float(m.group(3))
+        tail = extra_tail(i, m.group(4) or "")
+        code_m = re.search(r"(?:[A-Za-z]{1,3}\s*[-_]?)?(\d{3,4}[A-Za-z]*)", tail)
+        code = code_m.group(1) if code_m else None
+        type_ = "L자" if re.search(r"L\s*(?:타입|형|자|18|21)", tail, re.I) else None
+        kind = "원코드" if "원코드" in tail else ("셔터" if ("셔터" in tail or "심플" in tail) else None)
+        dirs = re.findall(r"[좌우]", tail)
+        handle_m = re.search(r"(?:끈|줄|손잡이(?:길이)?|손|봉)\s*[:=/-]?\s*(\d{2,3})", tail)
+        handle = int(handle_m.group(1)) if handle_m else None
+
+        for j, width in enumerate(widths):
+            item = template_for(width, height)
+            direction = dirs[j] if j < len(dirs) else (dirs[0] if len(widths) == 1 and dirs else item.get("손잡이방향"))
+            item.update({
+                "제품군": "블라인드",
+                "품목코드": code or item.get("품목코드"),
+                "타입": type_ or item.get("타입") or "C자",
+                "종류": kind or item.get("종류") or "투코드",
+                "가로": width, "세로": height,
+                "수량": 1, "손잡이방향": direction,
+                "설치장소": room or item.get("설치장소"),
+                "창개수": 1,
+                "좌개수": 1 if direction == "좌" else 0,
+                "우개수": 1 if direction == "우" else 0,
+                "원문": f"{line} {lines[i+1] if i+1 < len(lines) and tail.endswith(lines[i+1]) else ''}".strip(),
+            })
+            if handle is not None:
+                item["손잡이길이"] = handle
+            if code and not item.get("색상원문"):
+                item["색상원문"] = code
+            conf = dict(item.get("확신도") or {})
+            conf.update({"가로": 1.0, "세로": 1.0})
+            if direction:
+                conf["손잡이"] = 1.0
+            if code:
+                conf["품목코드"] = max(float(conf.get("품목코드") or 0), 0.9)
+            item["확신도"] = conf
+            rebuilt.append(item)
+
+    if rebuilt:
+        # 치수가 없는 부속/예외품목은 모델 결과에서 보존한다.
+        extras = []
+        for it in existing:
+            if it.get("예외품목") or it.get("_holding_accessory"):
+                extras.append(it)
+        data["items"] = rebuilt + extras
+    return data
+def _clean_rt_note_text(value):
+    """RT 제작 기재사항에서 배송 결제 문구를 제거한다."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = re.sub(r"(?:택배비\s*)?(?:선불|착불)", " ", text, flags=re.I)
+    text = re.sub(r"\s*[/|,]+\s*", "/", text)
+    text = re.sub(r"/{2,}", "/", text).strip(" /,-")
+    return text or None
+
+
+def _rt_receiver_from_item(item):
+    """루임트 주소 뒤 수령인 표기의 결정적 약칭을 복원한다."""
+    raw = " ".join(str(item.get(k) or "") for k in
+                   ("기재사항", "원문", "색상원문"))
+    if "더커튼" in raw or re.search(r"(?:^|[/,\s])더(?:$|[/,\s])", raw):
+        return "더"
+    if re.search(r"(?:^|[/,\s])지엘(?:$|[/,\s])", raw):
+        return "지엘"
+    if re.search(r"(?:^|[/,\s])H(?:$|[/,\s])", raw, re.I):
+        return "H"
+    return None
+
+
+def _postprocess_rt(data):
+    """루임트는 주소/수령인과 결제 표기를 후처리로 한 번 더 고정한다."""
+    delivery = data.setdefault("배송", {})
+    # 착불/선불은 배송 정보에만 남기고 제작 메모에서는 제거한다.
+    delivery["전달사항"] = _clean_rt_note_text(delivery.get("전달사항"))
+    data["전체기재사항"] = _clean_rt_note_text(data.get("전체기재사항"))
+    receiver_common = str(delivery.get("수령인") or "").strip()
+    if receiver_common == "더":
+        # 주소(화물/택배)의 받는 곳은 줄이지 않고 `더커튼`으로 적는다.
+        delivery["수령인"] = "더커튼"
+    if receiver_common == "더커튼":
+        receiver_common = "더"   # 기재사항에만 `더`로 줄인다.
+    for item in data.get("items") or []:
+        note = _clean_rt_note_text(item.get("기재사항"))
+        receiver = _rt_receiver_from_item(item) or receiver_common
+        if receiver == "더커튼":
+            receiver = "더"
+        parts = [x.strip() for x in str(note or "").split("/") if x.strip()]
+        # 더커튼은 항상 '더'로 축약한다.
+        parts = ["더" if x == "더커튼" else x for x in parts]
+        if receiver and receiver not in parts:
+            parts.insert(0, receiver)
+        item["기재사항"] = "/".join(dict.fromkeys(parts)) or None
+    return data
+
+
+def _clean_true_accessory_note(value):
+    """인천)트루 부속은 별도 행으로 만들되 일반 `피스추가` 표시는 보존한다.
+
+    사용자가 요청한 것은 노피스/스냅의 *개수*를 기재사항에 중복하지 않는 것이다.
+    따라서 `피스추가` 자체는 장부/EDI의 `피스`로 남긴다.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    # 부속 원문과 뒤따르는 수량 표현은 별도 부속행으로 처리한다.
+    text = re.sub(r"창틀용\s*무타공\s*(?:\d+\s*(?:세트|개|EA))?", " ", text, flags=re.I)
+    text = re.sub(r"커튼박스용\s*무타공\s*(?:\d+\s*(?:세트|개|EA))?", " ", text, flags=re.I)
+    text = re.sub(r"(?<![가-힣A-Za-z])스냅\s*(?:\d+\s*(?:세트|개|EA))?(?![가-힣A-Za-z])", " ", text, flags=re.I)
+    # 노피스(1)/(2) 같은 부속 개수 표시는 메모에서 제거한다.
+    text = re.sub(r"노피스\s*(?:\(\s*\d+\s*\)|\d+)?", " ", text, flags=re.I)
+    # 일반 피스 요청은 남긴다. `피스추가` -> `피스`.
+    text = re.sub(r"피스\s*추가", "피스", text, flags=re.I)
+    # 트루 공통 배송/출고 문구는 제작 기재사항에서 제외한다.
+    text = re.sub(r"택배비\s*선불", " ", text)
+    text = re.sub(r"빠른\s*출고", " ", text)
+    text = re.sub(r"\s*[+|,]+\s*", "/", text)
+    text = re.sub(r"\s*/\s*", "/", text)
+    text = re.sub(r"/{2,}", "/", text).strip(" /,.-+")
+    # 중복 토큰 제거. `피스/피스` 방지.
+    parts = []
+    for part in text.split('/'):
+        part = part.strip()
+        if part and part not in parts:
+            parts.append(part)
+    return "/".join(parts) or None
+
+
+def _postprocess_true(data):
+    """인천)트루 부속/배송 규칙을 코드로 확정한다."""
+    whole = " ".join(str(x or "") for x in (
+        data.get("전체원문"), data.get("전체기재사항")))
+    item_raw = " ".join(" ".join(str(it.get(k) or "") for k in
+                                   ("원문", "기재사항", "색상원문"))
+                        for it in (data.get("items") or []))
+    raw = f"{whole} {item_raw}"
+    accessories = []
+    if re.search(r"창틀용\s*무타공", raw):
+        accessories.append({"표시": "노피스(2)", "품명": "노피스브라켓(2EA)",
+                            "관리코드": "노피스브라켓(2EA)", "수량": 1})
+    if re.search(r"커튼박스용\s*무타공", raw):
+        accessories.append({"표시": "노피스(1)", "품명": "노피스브라켓(1EA)-커튼박스용",
+                            "관리코드": "노피스브라켓(1EA)-커튼박스용", "수량": 1})
+    if re.search(r"(?<![가-힣A-Za-z])스냅(?![가-힣A-Za-z])", raw):
+        accessories.append({"표시": "B 원코드 브라켓", "품명": "B브라켓(25mm원코드/구)",
+                            "관리코드": "B브라켓(25mm원코드/구)", "수량": 1})
+    if accessories:
+        # 같은 부속이 원문 여러 곳에 반복되어도 주문당 한 행만 만든다.
+        uniq = []
+        seen = set()
+        for acc in accessories:
+            key = acc["표시"]
+            if key not in seen:
+                uniq.append(acc); seen.add(key)
+        data["_true_accessories"] = uniq
+
+    # 트루 메시지는 배송을 기본 택배로 본다. 모델이 주소/선불을 읽었으면 그대로 보존한다.
+    delivery = data.setdefault("배송", {})
+    if delivery.get("주소") and not delivery.get("방식"):
+        delivery["방식"] = "택배"
+    if re.search(r"택배비\s*선불", raw) and not delivery.get("선불착불"):
+        delivery["선불착불"] = "선불"
+
+    data["전체기재사항"] = _clean_true_accessory_note(data.get("전체기재사항"))
+    for item in data.get("items") or []:
+        item["기재사항"] = _clean_true_accessory_note(item.get("기재사항"))
+    return data
+
+
+def _mark_non_di_mix(data):
+    """대일 외 거래처는 원문에 MIX가 보이면 표시용 플래그를 보존한다."""
+    if data.get("거래처") == "DI":
+        return
+    for item in data.get("items") or []:
+        raw = " ".join(str(item.get(k) or "") for k in
+                       ("색상원문", "원문", "기재사항"))
+        if re.search(r"(?<![A-Za-z])MIX(?![A-Za-z])|믹스", raw, re.I):
+            item["_mix_word"] = True
+
+
 def extract_order(image_paths, client_hint=None, ship_date=None, model=None):
     """여러 장을 한 번의 호출에 함께 넣는다 (스크롤 분할·첨부 사진 대응)"""
     if isinstance(image_paths, (str, Path)):
@@ -247,6 +653,13 @@ def extract_order(image_paths, client_hint=None, ship_date=None, model=None):
             "image_url": {"url": f"data:image/png;base64,{_encode(str(p))}",
                           "detail": "high"},
         })
+        if client_hint == "JO":
+            content.append({"type": "text", "text": "제이원 품목표 확대본입니다. 수량/손잡이 좌/우 숫자를 행별로 다시 대조하세요."})
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{_encode_jo_table_crop(str(p))}",
+                              "detail": "high"},
+            })
 
     if client is None:
         raise RuntimeError("API 키가 없습니다. .env 파일을 확인해 주세요.")
@@ -269,7 +682,8 @@ def extract_order(image_paths, client_hint=None, ship_date=None, model=None):
             for item in data.get("items") or []:
                 if str(item.get("손잡이방향") or "").strip() == "ㅈ":
                     item["손잡이방향"] = "좌"
-                if client_hint == "SP":
+                _normalize_holding_item(item)
+                if client_hint == "SP" and item.get("_product_group") != "holding":
                     raw = " ".join(str(item.get(k) or "")
                                    for k in ("수량", "원문", "기재사항"))
                     fraction = re.search(r"(?<!\d)1\s*/\s*([2-9])(?!\d)", raw)
@@ -315,12 +729,112 @@ def extract_order(image_paths, client_hint=None, ship_date=None, model=None):
                         r"(?:오늘|내일|모레|월요일|화요일|수요일|목요일|금요일|토요일|일요일)?\s*"
                         r"출고\s*(?:부탁드립니다|부탁드려요|요청|희망)?", "", note)
                     item["기재사항"] = note.strip(" /,.") or None
+            _postprocess_direction_sequence(data)
+            _mark_non_di_mix(data)
+            if data.get("거래처") == "RT":
+                _postprocess_rt(data)
+            if data.get("거래처") == "JO":
+                _postprocess_jo(data)
+            if data.get("거래처") == "인천)트루":
+                _postprocess_true(data)
+            if data.get("거래처") == "아지트":
+                _postprocess_azit(data)
             if data.get("거래처") == "MS":
                 common = str(data.get("전체기재사항") or "")
                 common = re.sub(
                     r"(?:오늘|내일|모레|월요일|화요일|수요일|목요일|금요일|토요일|일요일)?\s*"
                     r"출고\s*(?:부탁드립니다|부탁드려요|요청|희망)?", "", common)
                 data["전체기재사항"] = common.strip(" /,.") or None
+            if data.get("거래처") == "JL":
+                # JL은 모델 판독 뒤에도 결정 가능한 규칙을 한 번 더 강제한다.
+                whole = str(data.get("전체원문") or "")
+                # 발주번호는 우측 상단 괄호 안 숫자가 정답이다. 모델이 놓치면
+                # 명시 라벨 -> 괄호 안 숫자 순으로 보완하고, 내부 값에는 괄호를 제거한다.
+                raw_no = str(data.get("주문번호") or "").strip()
+                raw_no = re.sub(r"^[（(]\s*|\s*[）)]$", "", raw_no).strip()
+                if not raw_no:
+                    no = re.search(
+                        r"(?:발주|주문)\s*번\s*호\s*[:：]?\s*[（(]?\s*([A-Za-z0-9-]+)\s*[）)]?", whole)
+                    if not no:
+                        no = re.search(r"[（(]\s*(\d[\d-]*)\s*[）)]", whole)
+                    if no:
+                        raw_no = no.group(1)
+                data["주문번호"] = raw_no or None
+
+                # JL 이름 뒤 내부 표기 DW는 장부/EDI에 필요 없다.
+                if data.get("고객명"):
+                    data["고객명"] = re.sub(r"\s*DW\s*$", "",
+                                             str(data["고객명"]).strip(), flags=re.I).strip() or None
+                if not data.get("고객명"):
+                    receiver = str((data.get("배송") or {}).get("수령인") or "").strip()
+                    receiver = re.sub(r"\s*DW\s*$", "", receiver, flags=re.I).strip()
+                    if receiver:
+                        data["고객명"] = receiver
+                delivery = data.get("배송") or {}
+                if delivery.get("수령인"):
+                    delivery["수령인"] = re.sub(r"\s*DW\s*$", "",
+                                                  str(delivery["수령인"]).strip(),
+                                                  flags=re.I).strip() or None
+
+                common_parts = []
+                jl_customer = re.sub(r"\s*DW\s*$", "",
+                                     str(data.get("고객명") or "").strip(), flags=re.I).strip()
+                for part in str(data.get("전체기재사항") or "").split("/"):
+                    part = part.strip()
+                    if not part or re.search(r"(?:비닐\s*포장|겉\s*비닐|걷\s*비닐)", part):
+                        continue
+                    part_no_dw = re.sub(r"\s*DW\s*$", "", part, flags=re.I).strip()
+                    if jl_customer and part_no_dw == jl_customer:
+                        continue
+                    if re.fullmatch(r"DW", part, re.I):
+                        continue
+                    if part_no_dw not in common_parts:
+                        common_parts.append(part_no_dw)
+                # `원코드`는 JL 발주서에서 고정 칸이 아니다. 각 행 원문/색상원문/
+                # 기재사항 어디에서든 읽고, 페이지 전체가 원코드 단일 종류일 때는
+                # 전체 품목에 적용한다.
+                whole_has_one = bool(re.search(r"원\s*코드", whole))
+                whole_has_two = bool(re.search(r"투\s*코드", whole))
+                explicit_piece = "피스" in whole
+                for item in data.get("items") or []:
+                    raw = str(item.get("원문") or "")
+                    note = str(item.get("기재사항") or "")
+                    kind_text = " ".join(str(item.get(k) or "") for k in
+                                         ("색상원문", "원문", "기재사항"))
+                    if re.search(r"원\s*코드", kind_text) or (whole_has_one and not whole_has_two):
+                        item["종류"] = "원코드"
+                    elif re.search(r"투\s*코드", kind_text):
+                        item["종류"] = "투코드"
+                    if "피스" in raw or "피스" in note:
+                        explicit_piece = True
+                    # 포장 지시는 출력 대상이 아니다.
+                    cleaned = []
+                    for part in note.split("/"):
+                        part = part.strip()
+                        if not part or re.search(
+                                r"(?:비닐\s*포장|겉\s*비닐|걷\s*비닐)", part):
+                            continue
+                        cleaned.append(part)
+                    note = "/".join(cleaned)
+                    # 해당 행 원문에 '틀안'이 없는데 모델이 만들어낸 경우 제거한다.
+                    if raw and "틀안" not in raw:
+                        note = re.sub(r"(?:^|/)\s*틀안\s*(?=/|$)", "", note)
+                        note = re.sub(r"/{2,}", "/", note).strip("/")
+                    item["기재사항"] = note or None
+                    # L 표기가 실제 행 원문에 없으면 C타입으로 되돌린다.
+                    if item.get("타입") == "L자" and raw:
+                        explicit_l = re.search(
+                            r"(?:^|[\s/,(])L\s*(?:자|타입|형|18|21)(?:$|[\s/),])", raw, re.I)
+                        if not explicit_l:
+                            item["타입"] = "C자"
+                if explicit_piece and "피스" not in common_parts:
+                    common_parts.insert(0, "피스")
+                data["전체기재사항"] = "/".join(common_parts) or None
+            # 배송은 모델의 추측값을 그대로 쓰지 않는다. 업체 기본값을 우선하고,
+            # 발주서 원문에 택배/화물/내사/배달 등이 명시된 경우에만 예외로 덮어쓴다.
+            # 특히 "내일 출고", "빠른 출고"만으로는 배송 방식이 바뀌지 않는다.
+            apply_delivery_policy(data)
+
             data["_meta"] = {
                 "model": resp.model,
                 "files": [os.path.basename(str(p)) for p in image_paths],
@@ -345,40 +859,12 @@ def extract_order(image_paths, client_hint=None, ship_date=None, model=None):
 # ─────────────────────────────────────────────
 # 후처리: 추출값 -> 장부에 넣을 형태
 # ─────────────────────────────────────────────
-def default_handle_length(kind, height):
-    if height is None:
-        return None
-    if kind == "원코드":
-        return 150 if height >= 210 else 130
-    if kind == "투코드":
-        return 150 if height >= 210 else 100
-    if kind == "셔터":
-        if height >= 210:
-            return 150
-        if height >= 100:
-            return 100
-        return int(height // 10) * 10 - 10
-    return None
-
-
-def normalize_handle(length):
-    """10단위 내림. 보정이 있었으면 확인 대상."""
-    if length is None:
-        return None, False
-    r = (int(length) // 10) * 10
-    return r, r != int(length)
-
-
-def color_text(kind, code):
-    """장부 색상 열 문자열. 종류 표기는 투코드일 때 생략."""
-    part = "" if kind == "투코드" else f"{kind} "
-    return f"B {part}{code}".replace("  ", " ")
-
-
 def ledger_color(item):
-    """B [L18-]{종류} {코드}"""
+    """B [L18-]{종류} {코드}; 믹스는 이름과 전체 조합을 보존."""
     code = item.get("품목코드") or ""
     kind = item.get("종류") or "투코드"
+    if item.get("_mix_name") and item.get("_mix_codes"):
+        code = f"{item['_mix_name']} ({item['_mix_codes']})"
     if item.get("타입") == "L자":
         return f"B L18-{kind} {code}".strip()
     if kind == "투코드":
