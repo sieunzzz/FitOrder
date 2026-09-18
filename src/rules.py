@@ -44,10 +44,23 @@ def strip_vinyl_text(value):
 # ─────────────────────────────────────────────
 MIX_WORD_RX = re.compile(r"(?<![A-Za-z])mix(?![A-Za-z])|믹스", re.I)
 _MIX_CODE = r"\d{3,4}(?:FP|P)?"
-_MIX_AMOUNT = r"(?:\s*\(\s*\d+(?:\.\d+)?\s*(?:%|cm|㎝)?\s*\))?"
+_MIX_UNIT = r"(?:%|cm|㎝)?"
+# 수량 표기는 괄호 `102(70%)` 와 꺾쇠 `102<7>` 를 모두 지원한다(꺾쇠는 비율 표기).
+_MIX_AMOUNT = (rf"(?:\s*(?:\(\s*\d+(?:\.\d+)?\s*{_MIX_UNIT}\s*\)"
+               rf"|[<〈＜]\s*\d+(?:\.\d+)?\s*{_MIX_UNIT}\s*[>〉＞]))?")
+# 코드 사이 구분은 `+`, `:`, `/` 를 인정하고 `상`/`하` 같은 위치 표기는 건너뛴다.
+# 예: `상 102<7> : 하 870<3>`
 MIX_COMBO_RX = re.compile(
-    rf"(?<![\d.]){_MIX_CODE}{_MIX_AMOUNT}(?:\s*[+＋]\s*{_MIX_CODE}{_MIX_AMOUNT})+", re.I)
-_MIX_PART_RX = re.compile(rf"({_MIX_CODE})\s*(?:\(\s*(\d+(?:\.\d+)?)\s*(%|cm|㎝)?\s*\))?", re.I)
+    rf"(?<![\d.]){_MIX_CODE}{_MIX_AMOUNT}"
+    rf"(?:\s*[+＋:：/]\s*(?:[상하]\s*[:：]?\s*)?{_MIX_CODE}{_MIX_AMOUNT})+", re.I)
+_MIX_PART_RX = re.compile(
+    rf"({_MIX_CODE})\s*(?:([(<〈＜])\s*(\d+(?:\.\d+)?)\s*({_MIX_UNIT})\s*[)>〉＞])?", re.I)
+# `상 102<7> : 하 870<3>` 처럼 상/하 색상 조합이나 꺾쇠 비율이 보이면
+# "믹스" 글자가 없어도 MIX 주문으로 본다(2026-09-16).
+MIX_LAYOUT_RX = re.compile(
+    rf"(?:[상하]\s*[:：]?\s*{_MIX_CODE}{_MIX_AMOUNT}\s*[+＋:：/]\s*[상하]\s*[:：]?\s*{_MIX_CODE}"
+    rf"|{_MIX_CODE}\s*[<〈＜]\s*\d+(?:\.\d+)?\s*{_MIX_UNIT}\s*[>〉＞]"
+    rf"\s*[+＋:：/]\s*(?:[상하]\s*[:：]?\s*)?{_MIX_CODE})", re.I)
 
 
 def round_half(value):
@@ -70,29 +83,29 @@ def parse_mix_parts(text, height):
     match = MIX_COMBO_RX.search(str(text or ""))
     if not match:
         return None
-    raw = [(code.upper(), float(num) if num else None, (unit or "").lower())
-           for code, num, unit in _MIX_PART_RX.findall(match.group(0))]
+    raw = [(code.upper(), (bracket or ""), float(num) if num else None, (unit or "").lower())
+           for code, bracket, num, unit in _MIX_PART_RX.findall(match.group(0))]
     if len(raw) < 2:
         return None
     try:
         h = float(height)
     except (TypeError, ValueError):
         h = None
-    units = {u for _, n, u in raw if n is not None}
-    nums = [n for _, n, _ in raw if n is not None]
-    if nums and not units:
-        # 단위 없는 숫자: 합이 세로면 길이, 합이 100이면 비율로 본다.
-        total = sum(nums)
-        as_percent = (len(nums) == len(raw) and h is not None
-                      and abs(total - h) > 0.01 and abs(total - 100) < 0.01)
-    else:
-        as_percent = False
+    units = {u for _, _, n, u in raw if n is not None and u}
+    nums = [n for _, _, n, _ in raw if n is not None]
+    total = sum(nums)
+    # 단위(%/cm) 표기가 없는 숫자는 길이 합이 세로와 같을 때만 길이로 본다.
+    # 합이 다르면 비율이다: `7:3`, `<7>·<3>`, `70+30` 모두 세로를 그 비율로 나눈다.
+    as_ratio = bool(nums and not units and len(nums) == len(raw) and total > 0
+                    and h is not None and abs(total - h) > 1.0)
     lengths = []
-    for _, num, unit in raw:
+    for _, _bracket, num, unit in raw:
         if num is None:
             lengths.append(None)
-        elif unit == "%" or as_percent:
+        elif unit == "%":
             lengths.append(h * num / 100 if h is not None else None)
+        elif as_ratio:
+            lengths.append(h * num / total)
         else:
             lengths.append(num)
     missing = [i for i, v in enumerate(lengths) if v is None]
@@ -102,7 +115,7 @@ def parse_mix_parts(text, height):
         for i in missing:
             lengths[i] = share
     return [{"코드": code, "길이": (round_half(v) if v is not None else None)}
-            for (code, _, _), v in zip(raw, lengths)]
+            for (code, _, _, _), v in zip(raw, lengths)]
 
 
 def mix_memo_text(item):
@@ -286,6 +299,25 @@ BONO_LIKE_CLIENTS = BONO_STYLE_CLIENTS | {"안산)보노"}
 # 현장 장부에는 `(택배)` / `(화물)`을 적지 않는 것이 정답 양식이다.
 # 롤/콤비의 안산)보노도 같은 보노 규칙을 사용한다.
 NO_DELIVERY_LABEL_CLIENTS = {"휴안", "보노", "안산)보노", "미래가공"}
+
+# 거래처 담당자(발주를 넣어 주는 직원) 이름. 주문마다 반복해서 들어오지만
+# 실제 주문 정보가 아니므로 장부/작업지시서/경영박사 기재사항·적요에는 적지 않는다.
+# (2026-09-16 사용자 확정: JL 담당자 김현경)
+CLIENT_STAFF_NAMES = {"JL": {"김현경"}}
+
+
+# 이름 뒤에 붙는 호칭. `김현경님`, `김현경 대리`도 같은 사람으로 본다.
+STAFF_TITLE_RX = re.compile(r"\s*(?:님|씨|담당(?:자)?|대리|주임|과장|차장|부장|실장|이사|사장)\s*$")
+
+
+def is_client_staff_name(client, value):
+    """거래처 담당자 이름이면 True. 공백과 뒤에 붙은 호칭은 무시한다."""
+    names = CLIENT_STAFF_NAMES.get(client)
+    if not names:
+        return False
+    text = STAFF_TITLE_RX.sub("", str(value or "").strip())
+    text = re.sub(r"\s+", "", text)
+    return bool(text) and any(text == re.sub(r"\s+", "", n) for n in names)
 
 # 인천)트루 전용 추가부속. 장부/작업지시서에는 사용자 현장 표기를,
 # 경영박사에는 실제 등록 품목명을 사용한다. 노피스브라켓(2EA)은

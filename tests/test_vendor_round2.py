@@ -186,3 +186,26 @@ def test_roll_handle_rounds_down_to_5(tmp_path):
     assert _products(_rows([roll(153)], MR))[0]["모형2"] is None      # 150 = 기본값
     edi = _edi([roll(127)], MR, tmp_path / "r.xls")
     assert any("손125" in str(r[15]) for r in edi)
+
+
+# ───────────────────────── JL ─────────────────────────
+def test_jl_staff_name_never_in_notes(tmp_path):
+    """JL 담당자 김현경은 장부·전산 기재사항/적요에 적지 않는다(2026-09-16)."""
+    order = _blind("JL", [_item(w=100, 설치장소="거실"), _item(w=110, 설치장소="안방")],
+                   _delivery("김현경"), 고객명="김현경", 전체기재사항="피스/김현경",
+                   주문번호="17-9")
+    rows = _rows([order])
+    assert [r["기재사항"] for r in _products(rows)] == ["피스", "피스"]
+    assert not any("김현경" in f'{r.get("기재사항")}/{r.get("기재사항2")}' for r in _products(rows))
+    edi = _edi([order], MB, tmp_path / "e.xls")
+    assert not any("김현경" in str(r[15]) for r in edi if str(r[8]).startswith("B102"))
+    assert next(r for r in edi if r[8] == "포장비용(25mm)")[15] == ""
+    # 배송 받는사람으로는 그대로 남는다(주소행)
+    assert any("김현경" in str(r[15]) for r in edi if str(r[8]) == "**")
+
+
+def test_jl_real_customer_name_still_used(tmp_path):
+    order = _blind("JL", [_item(w=100)], _delivery("김현경"), 고객명="임지애",
+                   전체기재사항="피스/김현경", 주문번호="17-9")
+    rows = _rows([order])
+    assert _products(rows)[0]["기재사항"] == "피스/임지애"

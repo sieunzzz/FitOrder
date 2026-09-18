@@ -19,3 +19,5 @@ fitorder_master_backup_*.xlsx
 *.xlsx
 tests/golden/
 archive/**/golden/
+# 실제 발주서/출력물은 올리지 않는다
+*.pdf

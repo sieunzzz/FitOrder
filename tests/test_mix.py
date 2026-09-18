@@ -176,3 +176,48 @@ def test_mix_ledger_roundtrip_keeps_component_lengths(tmp_path):
     _, orders, _ = output.read_ledger(str(path), M, path.name)
     ready = dw.ledger_orders_for_precheck(orders, path, "blind", _cases.SHIP)
     assert _parts(_rows(ready)) == _parts(_rows(source))
+
+
+# ───────────────────────── 상/하 비율 표기 (2026-09-16) ─────────────────────────
+def test_ratio_notation_is_not_split_in_half():
+    """`상 102<7> : 하 870<3>`는 반씩이 아니라 7:3으로 나눈다."""
+    assert parse_mix_parts("상 102<7> : 하 870<3>/봉60", 70) == [{"코드": "102", "길이": 49.0},
+                                                                {"코드": "870", "길이": 21.0}]
+    assert parse_mix_parts("상 200<6> : 하 150<4>", 135) == [{"코드": "200", "길이": 81.0},
+                                                            {"코드": "150", "길이": 54.0}]
+    # 괄호 비율, `:` 구분, 단위 없는 비율도 같은 결과
+    assert parse_mix_parts("MIX 102(7)+870(3)", 70) == [{"코드": "102", "길이": 49.0},
+                                                        {"코드": "870", "길이": 21.0}]
+    assert parse_mix_parts("102(70%):870(30%)", 70) == [{"코드": "102", "길이": 49.0},
+                                                        {"코드": "870", "길이": 21.0}]
+    # 합이 세로와 같으면 길이 그대로, 비율 표기가 없으면 반씩
+    assert parse_mix_parts("MIX 200(108)+125(12)", 120) == [{"코드": "200", "길이": 108.0},
+                                                            {"코드": "125", "길이": 12.0}]
+    assert parse_mix_parts("MIX 102+870", 70) == [{"코드": "102", "길이": 35.0},
+                                                  {"코드": "870", "길이": 35.0}]
+
+
+def test_ratio_notation_in_ledger_rows():
+    """비고 원문이 그대로 들어와도 MIX로 잡고 비율대로 구성행을 만든다."""
+    order = _order("JL", [_mix_item("상 102<7> : 하 870<3>/봉60", 125, 70)])
+    rows = _rows([order])
+    assert _parts(rows) == [("102", 49.0, None), ("870", 21.0, None)]
+    product = next(r for r in rows if r.get("_특수") is None)
+    assert "102+870" in str(product["색상"])
+
+
+def test_explicit_l_type_words():
+    from extract import has_explicit_l_type
+    for text in ("L자형 18T 원코드", "92*55 짜리는 L자형입니다", "IV200L자형", "알루미늄 L자 25mm",
+                 "L타입 좌", "L형 18mm", "L-18 200"):
+        assert has_explicit_l_type(text), text
+    for text in ("L 180cm 알루미늄", "GL820 알루미늄", "YL500 심플", "알루미늄L 25mm"):
+        assert not has_explicit_l_type(text), text
+
+
+def test_mix_recovered_from_raw_row_text():
+    """모델이 색상칸에 한 색만 읽어도 행 원문의 상/하 표기로 두 색을 복구한다."""
+    order = _order("JL", [_mix_item("WH102", 125, 70,
+                                    원문="WH102 125*70 우 상 102<7> : 하 870<3>/봉60")])
+    rows = _rows([order])
+    assert _parts(rows) == [("102", 49.0, None), ("870", 21.0, None)]

@@ -630,6 +630,16 @@ def _postprocess_true(data):
     return data
 
 
+# `L자`, `L타입`, `L자형`, `L-18` 등 실제 L 표기. 색상 약어(GL, YL)나 `알루미늄L`,
+# `L 180cm` 같은 길이 표기는 L자로 보지 않는다.
+L_TYPE_RX = re.compile(r"(?<![A-Za-z가-힣])L\s*[-_]?\s*(?:자형|자|타입|형|(?:18|21)(?!\d))", re.I)
+
+
+def has_explicit_l_type(text):
+    """행 원문에 L자/L타입/L자형/L18 표기가 실제로 있으면 True."""
+    return bool(L_TYPE_RX.search(str(text or "")))
+
+
 def _mark_non_di_mix(data):
     """대일 외 거래처는 원문에 MIX가 보이면 표시용 플래그를 보존한다."""
     if data.get("거래처") == "DI":
@@ -822,11 +832,8 @@ def extract_order(image_paths, client_hint=None, ship_date=None, model=None):
                         note = re.sub(r"/{2,}", "/", note).strip("/")
                     item["기재사항"] = note or None
                     # L 표기가 실제 행 원문에 없으면 C타입으로 되돌린다.
-                    if item.get("타입") == "L자" and raw:
-                        explicit_l = re.search(
-                            r"(?:^|[\s/,(])L\s*(?:자|타입|형|18|21)(?:$|[\s/),])", raw, re.I)
-                        if not explicit_l:
-                            item["타입"] = "C자"
+                    if item.get("타입") == "L자" and raw and not has_explicit_l_type(raw):
+                        item["타입"] = "C자"
                 if explicit_piece and "피스" not in common_parts:
                     common_parts.insert(0, "피스")
                 data["전체기재사항"] = "/".join(common_parts) or None

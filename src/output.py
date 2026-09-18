@@ -20,10 +20,10 @@ from openpyxl.utils import get_column_letter
 
 from rules import (BONO_LIKE_CLIENTS, CLIENT_INFO, ERP_CLIENT_NAME, NO_DITTO, NO_MERGE_PLACE,
                    DI_CODE_ORDER, clean_delivery_notice, strip_vinyl_text,
-                   MIX_WORD_RX, mix_extra_cost_name, mix_length_text, mix_memo_text, parse_mix_parts,
+                   MIX_WORD_RX, MIX_LAYOUT_RX, mix_extra_cost_name, mix_length_text, mix_memo_text, parse_mix_parts,
                    PACKING_CLIENTS, PACKING_ITEM, BONO_PACKING_ITEM, BONO_STYLE_CLIENTS, TRUE_ACCESSORY_PRODUCTS,
                    Master, calc_erp, calc_roll_erp, default_handle_length, di_mix_info,
-                   ledger_color, normalize_handle, normalize_roll_handle)
+                   is_client_staff_name, ledger_color, normalize_handle, normalize_roll_handle)
 from roll_combo import ROLL_CLIENT_INFO, _roll_note_ignored
 
 from holding import (HOLDING_FEATURE_ENABLED, accessory_qty, holding_accessory_from_text, holding_calc,
@@ -307,7 +307,8 @@ def _prepare_blind_mix_items(order):
         sources = [source, codes_text, it.get("색상원문"), it.get("품목코드"), it.get("원문"), it.get("기재사항")]
         joined = " ".join(str(x or "") for x in sources)
         is_mix = bool(it.get("_mix_word") or it.get("_blind_mix") or it.get("_mix_parts_manual")
-                      or str(it.get("_mix_name") or "").upper() == "MIX" or MIX_WORD_RX.search(joined))
+                      or str(it.get("_mix_name") or "").upper() == "MIX" or MIX_WORD_RX.search(joined)
+                      or MIX_LAYOUT_RX.search(joined))
         if not is_mix and order.get("거래처") == "JL" and not it.get("_mix_name"):
             # JL: 발주서 같은 칸(색상)에 여러 색 코드가 있으면 MIX 로 본다.
             jl_codes = list(dict.fromkeys(
@@ -517,6 +518,19 @@ def _freight_ledger_text(delivery, phone_sep=" / "):
     if phone:
         return f"{left}{phone_sep}{phone}" if left else phone
     return left
+
+
+def _erp_ledger_handle(item):
+    """전산 적요에 넣을 손잡이길이 `손120`.
+
+    장부 길이 칸에 적히는 값과 같다: 기본 길이(종류·세로로 정해지는 값)는 적지 않고,
+    사전점검에서 사람이 직접 고친 길이는 기본값과 같아도 적는다(2026-09-18 사용자 확정).
+    """
+    if "_manual_handle_length" in item:
+        n = normalize_handle(item.get("_manual_handle_length"))[0]
+    else:
+        n = _handle(item.get("종류"), item.get("세로"), item.get("손잡이길이"))
+    return f"손{n}" if n else None
 
 
 def _erp_memo_join(parts):
@@ -860,6 +874,9 @@ def _jl_clean_parts(parts, customer=None, order_no=None, keep_piece=False):
         text = str(part or "").strip()
         if not text or JL_PACKAGING.search(text):
             continue
+        # 거래처 담당자 이름(예: JL 김현경)은 주문 정보가 아니므로 적지 않는다.
+        if is_client_staff_name("JL", text):
+            continue
         bare_order = re.sub(r"^[（(]\s*|\s*[）)]$", "", text).strip()
         if order_no and bare_order == order_no:
             continue
@@ -1066,6 +1083,8 @@ def to_rows(order, ship_label, M=None, sort_di=True):
     cust = (order.get("고객명") or "").replace("/", "-").strip()
     if client == "JL":
         cust = _jl_customer_name(cust)
+        if is_client_staff_name(client, cust):
+            cust = ""
     head = "/".join(x for x in (body, cust) if x)
     window_count = _order_window_count(items)
     single = window_count <= 1 and client not in NO_MERGE_PLACE
@@ -2544,7 +2563,8 @@ def _erp_order_name(order):
     receiver = str(delivery.get("수령인") or "").strip()
     customer = str(order.get("고객명") or "").strip()
     if client == "JL":
-        return _jl_customer_name(customer or receiver)
+        name = _jl_customer_name(customer or receiver)
+        return "" if is_client_staff_name(client, name) else name
     if client == "RT" and receiver == "더커튼":
         receiver = "더"
     # 배송 정보가 없는 자기 배송은 받는 이름이 없다(장부에서 되돌릴 수 없는 고객명으로 채우지 않음).
@@ -2950,6 +2970,8 @@ def build_erp(orders, M, path, order_date=None):
             elif client == "JL":
                 common = str(o.get("전체기재사항") or "")
                 receiver = _jl_customer_name(o.get("고객명") or delivery.get("수령인") or "")
+                if is_client_staff_name(client, receiver):
+                    receiver = ""
                 all_parts = _split_note_parts(it.get("_수동특이"), common,
                                              it.get("기재사항"), it.get("설치장소"))
                 # JL EDI 적요 순서 고정: 손잡이길이 -> 피스 -> 이름 -> 나머지 기재사항.
@@ -2965,6 +2987,10 @@ def build_erp(orders, M, path, order_date=None):
                     if part not in extra_parts:
                         extra_parts.append(part)
             else:
+                # 기본 길이가 아닌 손잡이길이는 전 업체 전산 적요에 적는다(2026-09-18).
+                handle_text = _erp_ledger_handle(it)
+                if handle_text:
+                    extra_parts.append(handle_text)
                 # 화면에서 직접 입력한 특이사항도 모든 거래처의 EDI 적요에 반영한다.
                 manual_special = str(it.get("_수동특이") or "").strip()
                 if manual_special:
@@ -3007,6 +3033,9 @@ def build_erp(orders, M, path, order_date=None):
                     if sp:
                         production_parts.append(sp)
                 else:
+                    handle_text = _erp_ledger_handle(it)
+                    if handle_text:
+                        production_parts.append(handle_text)
                     sp = str(it.get("_수동특이") or "").strip()
                     if sp:
                         production_parts.append(sp)
@@ -3897,6 +3926,7 @@ def _restore_jl_ledger_notes(order):
     for part in shared:
         candidate = _jl_customer_name(part)
         if (not candidate or "피스" in candidate or JL_PACKAGING.search(candidate)
+                or is_client_staff_name("JL", candidate)
                 or re.fullmatch(r"손\d{2,3}", candidate) or candidate in {"틀안", "포장X", "브라켓"}):
             continue
         order["고객명"] = candidate

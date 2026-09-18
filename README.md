@@ -127,6 +127,16 @@ flowchart LR
 - 휴안: 가장 긴 창의 부속을 이름 앞에 (`석고앙카3/박시은`) — 공통 처리가 이름을 맨 앞으로 옮기던 문제
 - 유앤: 피스 종류를 가로별 피스 수 합계 `10EA`로 장부·경영박사에 출력(이전에는 경영박사에 부속행이 아예 없었음), 장부 역변환도 새 형식을 읽음
 
+## 2026-09-18 변경
+- 기본 길이가 아닌 손잡이길이를 전 업체 경영박사 적요에 `손120`으로 넣는다 (`output._erp_ledger_handle`).
+  전에는 DI·JL·보노만 나오고 다른 업체는 사전점검 길이 칸에만 보였다. 기재사항에 `줄140`으로 적혀 있던 창은
+  적요 뒤쪽이 아니라 규격 바로 뒤에 `손140`으로 나온다 (`tests/test_handle_length_edi.py`)
+
+## 2026-09-16 변경
+- MIX 비율 표기 `상 102<7> : 하 870<3>` 인식 (`rules.MIX_COMBO_RX`/`parse_mix_parts`). 전에는 이 표기를 못 읽어 세로를 반씩 나눴다. 비고에만 있고 `믹스` 글자가 없어도 MIX로 처리(`rules.MIX_LAYOUT_RX`), 모델이 색을 하나만 읽어도 행 원문에서 두 색을 복구한다
+- `L자형` 표기가 C자로 되돌려지던 문제 수정 (`extract.has_explicit_l_type`)
+- JL 담당자 이름(`김현경`)은 기재사항·경영박사 적요에 적지 않는다 (`rules.CLIENT_STAFF_NAMES`에 거래처별 담당자 이름을 추가하면 다른 업체도 같은 규칙 적용)
+
 ## 2026-09-14 코드 정리 (동작 변경 없음)
 - 삭제: `src/app.py`(Streamlit, `archive/`에 보관), `src/fitorder/ai_extract.py`, `src/blind_extra.py`, streamlit 설치 항목
 - 호출되지 않던 함수/상수 삭제: qt_app `HoldingPage`, extract의 rules 중복 함수(`default_handle_length`/`normalize_handle`/`color_text`), holding `is_holding_feature_item`, roll_combo `get_roll_master`, master_registry `clear_master_cache`, parsers `_freight_info`, output `_al`/`_border`/`INNER`/`ERP_HEAD`, rules `EXCEPTION_WORDS`/`COLOR_FONT`/`NOTE_FONT`/`similar`
@@ -134,7 +144,7 @@ flowchart LR
 
 ## 알려진 한계 (미수정)
 - 유앤 피스 품목(`피스(석고앙카)` 등)은 로컬 품목장에 없어 경영박사 규격 칸이 비어 있다(경영박사가 관리코드로 채우는지 확인 필요)
-- 장부에는 기본 손잡이 길이를 적지 않으므로, 장부 → 경영박사에서는 발주서에 기본값과 같은 길이(예: 손130)가 적혀 있었어도 적요에 나오지 않는다
+- DI·JL·보노/미래가공은 발주서에 기본 길이(예: 손130)가 적혀 있으면 적요에 적지만, 장부에는 기본 길이를 적지 않으므로 장부 → 경영박사에서는 그 표기가 나오지 않는다(그 외 업체는 양쪽 모두 기본 길이를 적지 않아 결과가 같다)
 - DI 장부는 유형별 시트로 나뉘고 특이(연창 #) 칸이 없어, 장부 → 경영박사에서 주문 묶음·연창·배송/포장 귀속이 원래와 다를 수 있다(제품·수량·단가는 같음). 사전점검에서 확인 필요
 - DI는 파일 생성 때 행을 정렬하므로, 정렬 후 떨어진 행에 걸친 수동 병합은 엑셀에 반영되지 않고 안내만 표시된다
 - 품목장 `B-MIX-L18/셔터/25mm`는 2026-09-13 추가, 단가 칸은 비워 둠(사람이 직접 입력 전까지 EDI 단가 0). 경영박사 관리코드는 `B-MIX-L18/원코드/25mm`
