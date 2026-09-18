@@ -516,7 +516,7 @@ ROLL_SYSTEM_PROMPT = """너는 블라인드 제조공장의 롤스크린/콤비/
 
 
 def extract_roll_images(image_paths, master: RollComboMaster, client_hint: str | None = None, model=None) -> dict:
-    from extract import MAX_RETRY, MODEL, _encode, client
+    from extract import MAX_RETRY, MODEL, _encode, client, create_completion
     if client is None:
         raise RuntimeError("API 키가 없습니다. .env 파일을 확인해 주세요.")
     if isinstance(image_paths, (str, Path)):
@@ -528,11 +528,11 @@ def extract_roll_images(image_paths, master: RollComboMaster, client_hint: str |
     last = None
     for _attempt in range(MAX_RETRY):
         try:
-            resp = client.chat.completions.create(
+            resp = create_completion(
                 model=model or MODEL,
                 messages=[{"role": "system", "content": ROLL_SYSTEM_PROMPT},
                           {"role": "user", "content": content}],
-                response_format=ROLL_RESPONSE_FORMAT, temperature=0)
+                response_format=ROLL_RESPONSE_FORMAT)
             data = json.loads(resp.choices[0].message.content)
             if client_hint:
                 data["거래처"] = client_hint

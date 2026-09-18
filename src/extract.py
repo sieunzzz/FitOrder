@@ -44,6 +44,24 @@ _key = os.getenv("OPENAI_API_KEY")
 client = OpenAI(timeout=TIMEOUT, max_retries=0) if _key else None
 
 
+# 판독은 항상 같은 답이 나와야 하므로 temperature=0 을 쓴다.
+# 다만 일부 모델(gpt-5 계열)은 기본값만 허용하므로, 거부하면 빼고 다시 보낸다.
+_NO_TEMPERATURE = set()
+
+
+def create_completion(**kwargs):
+    """temperature=0 으로 호출하되, 모델이 거부하면 그 모델은 빼고 재시도한다."""
+    model = kwargs.get("model")
+    if model not in _NO_TEMPERATURE:
+        try:
+            return client.chat.completions.create(temperature=0, **kwargs)
+        except Exception as e:
+            if "temperature" not in str(e):
+                raise
+            _NO_TEMPERATURE.add(model)
+    return client.chat.completions.create(**kwargs)
+
+
 def extract_pdf(pdf_path, client_hint=None, ship_date=None, model=None):
     """PDF를 렌더링한다. SP는 페이지별 추출 후 같은 주문번호를 합친다."""
     try:
@@ -86,7 +104,9 @@ def extract_pdf(pdf_path, client_hint=None, ship_date=None, model=None):
 
         with tempfile.TemporaryDirectory(prefix="fitorder_pdf_") as td:
             paths = []
-            matrix = pymupdf.Matrix(2, 2)  # 약 144 dpi: 표의 작은 글자 판독용
+            # 약 144 dpi. SP는 손글씨 팩스 스캔이라 원본(약 200dpi)보다 높게 렌더한다.
+            zoom = 4 if client_hint == "SP" else 2
+            matrix = pymupdf.Matrix(zoom, zoom)
             for i, page in enumerate(doc):
                 pix = page.get_pixmap(matrix=matrix, alpha=False)
                 p = Path(td) / f"page_{i + 1:03d}.png"
@@ -153,10 +173,73 @@ def extract_pdf(pdf_path, client_hint=None, ship_date=None, model=None):
         doc.close()
 
 
+def prepare_sp_image(path):
+    """스페이스 작업일지 사진을 판독 전에 다듬는다(2026-09-18).
+
+    - 눕혀 찍힌 사진(가로가 더 긴 사진)은 세워서 양식 방향에 맞춘다.
+    - 연필 글씨 대비를 높인다. 크기는 줄이지 않는다(_encode 가 맞춘다).
+    """
+    src = Path(path)
+    try:
+        with Image.open(src) as img:
+            out = img.convert("RGB")
+            if out.width > out.height:      # 작업일지는 세로가 긴 양식이다
+                out = out.rotate(90, expand=True)
+            out = ImageOps.autocontrast(ImageOps.grayscale(out), cutoff=1).convert("RGB")
+            tmp = Path(tempfile.gettempdir()) / f"fitorder_sp_{src.stem}.png"
+            out.save(tmp, format="PNG", optimize=True)
+            return tmp
+    except Exception:
+        return src
+
+
 def _sp_order_key(value):
     """'<17-9>', '17 - 9' 등을 '17-9'로 통일한다."""
     m = re.search(r"(\d{1,2})\s*[-–]\s*(\d+)", str(value or ""))
     return f"{int(m.group(1))}-{int(m.group(2))}" if m else None
+
+
+SP_ORDER_NO_RX = re.compile(r"[<〈＜(]?\s*(\d{1,2})\s*[-–]\s*(\d{1,3})\s*[>〉＞)]?")
+
+
+def _fix_sp_order_no(data):
+    """SP 주문번호 보정(2026-09-18).
+
+    주문번호는 `현장전달사항` 칸에 `< 2-12 >`처럼 꺾쇠로 적힌다. 이 표기가 있으면
+    모델이 다르게 읽었더라도 그 값을 쓴다(모델이 `2-2`로 잘못 읽는 경우가 있다).
+    번호가 기재사항에 중복으로 남아 있으면 지운다.
+    """
+    texts = [data.get("전체기재사항"), data.get("전체원문")]
+    texts += [it.get("원문") for it in data.get("items") or []]
+    bracket = None
+    for text in texts:
+        for day, seq in re.findall(r"[<〈＜]\s*(\d{1,2})\s*[-–]\s*(\d{1,3})\s*[>〉＞]", str(text or "")):
+            # 주문번호는 `주문일-순번`이다. 현장 정보(예: 111-1806)와 구분한다.
+            if 1 <= int(day) <= 31 and int(seq) <= 99:
+                bracket = f"{int(day)}-{int(seq)}"
+                break
+        if bracket:
+            break
+    if bracket:
+        data["주문번호"] = bracket
+    else:
+        no = str(data.get("주문번호") or "").strip()
+        m = re.fullmatch(r"\s*(\d{1,2})\s*[-–]\s*(\d{1,3})\s*", no)
+        if m:
+            data["주문번호"] = f"{int(m.group(1))}-{int(m.group(2))}"
+
+    order_no = str(data.get("주문번호") or "").strip()
+    keep = []
+    for part in str(data.get("전체기재사항") or "").split("/"):
+        cleaned = re.sub(r"주문\s*번호\s*[:：]?", "", part).strip()
+        bare = cleaned.strip("<>〈〉＜＞() ")
+        if not cleaned or (order_no and bare == order_no):
+            continue
+        # 날짜 칸 문구는 기재사항이 아니다.
+        if re.fullmatch(r"(?:주문|발송)?\s*날짜\s*[:：]?\s*\d{0,2}\s*월?\s*\d{0,2}\s*일?\s*(?:요일)?", cleaned):
+            continue
+        keep.append(cleaned)
+    data["전체기재사항"] = "/".join(keep) or None
 
 
 def _merge_sp_orders(page_orders):
@@ -220,18 +303,22 @@ def diagnose():
                 "네트워크 담당자에게 api.openai.com 허용을 요청해 주세요.")
 
 
-def _encode(path: str) -> str:
-    """긴 변을 MIN_SIDE ~ MAX_SIDE 범위로 맞춘 뒤 base64 PNG 로 반환.
-       캡처가 작으면 확대한다 — 타일 수가 늘어 작은 글자 판독이 좋아진다."""
+def _encode(path: str, max_side: int = MAX_SIDE, min_side: int = MIN_SIDE) -> str:
+    """긴 변을 min_side ~ max_side 범위로 맞춘 뒤 base64 PNG 로 반환.
+
+    캡처가 작으면 확대한다 — 타일 수가 늘어 작은 글자 판독이 좋아진다.
+    다만 스캔 원본이 이미 큰 손글씨 팩스(SP)는 확대하면 흐려지기만 하므로
+    호출자가 min_side=0 으로 끄고 max_side 를 크게 준다.
+    """
     img = Image.open(path)
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     w, h = img.size
     long_side = max(w, h)
-    if long_side > MAX_SIDE:
-        k = MAX_SIDE / long_side
-    elif long_side < MIN_SIDE:
-        k = MIN_SIDE / long_side
+    if long_side > max_side:
+        k = max_side / long_side
+    elif long_side < min_side:
+        k = min_side / long_side
     else:
         k = 1
     if k != 1:
@@ -263,6 +350,47 @@ def _encode_jo_table_crop(path: str) -> str:
         crop = crop.resize((int(crop.width * k), int(crop.height * k)), Image.LANCZOS)
     buf = io.BytesIO()
     crop.save(buf, format="PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _encode_sp_header_crop(path: str) -> str:
+    """SP 작업일지 윗부분(현장전달사항·주문처상호·주문날짜)만 잘라 확대한다.
+
+    주문번호 `< 2-21 >`과 상호 칸 동그라미 숫자가 전체 페이지에서는 작게 보여
+    자주 놓친다(2026-09-18).
+    """
+    img = Image.open(path)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    w, h = img.size
+    crop = img.crop((0, 0, w, int(h * 0.30)))
+    crop = ImageOps.autocontrast(ImageOps.grayscale(crop), cutoff=0.5)
+    long_side = max(crop.size)
+    if long_side < 2000:
+        k = 2000 / long_side
+        crop = crop.resize((int(crop.width * k), int(crop.height * k)), Image.LANCZOS)
+    buf = io.BytesIO()
+    crop.convert("RGB").save(buf, format="PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _encode_sp_table_crop(path: str) -> str:
+    """SP 작업일지의 표만 잘라 확대한다.
+
+    좌/우 칸의 작대기(창 개수)와 소수점 쉼표가 전체 페이지에서는 너무 작게 보인다.
+    """
+    img = Image.open(path)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    w, h = img.size
+    crop = img.crop((0, int(h * 0.27), w, int(h * 0.86)))
+    crop = ImageOps.autocontrast(ImageOps.grayscale(crop), cutoff=0.5)
+    long_side = max(crop.size)
+    if long_side < 2400:
+        k = 2400 / long_side
+        crop = crop.resize((int(crop.width * k), int(crop.height * k)), Image.LANCZOS)
+    buf = io.BytesIO()
+    crop.convert("RGB").save(buf, format="PNG", optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -658,11 +786,31 @@ def extract_order(image_paths, client_hint=None, ship_date=None, model=None):
 
     content = [{"type": "text", "text": user_prompt(client_hint, ship_date)}]
     for p in image_paths:
+        encoded = (_encode(str(p), max_side=2600, min_side=0) if client_hint == "SP"
+                   else _encode(str(p)))
         content.append({
             "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{_encode(str(p))}",
+            "image_url": {"url": f"data:image/png;base64,{encoded}",
                           "detail": "high"},
         })
+        if client_hint == "SP":
+            content.append({"type": "text", "text":
+                            "스페이스 작업일지 윗부분 확대본입니다. `현장전달사항` 칸의 "
+                            "`< 2-21 >` 같은 주문번호, `주문처상호` 칸의 동그라미 숫자, "
+                            "주문날짜를 이 확대본에서 반드시 읽으세요."})
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{_encode_sp_header_crop(str(p))}",
+                              "detail": "high"},
+            })
+            content.append({"type": "text", "text":
+                            "스페이스 작업일지 표 확대본입니다. 손잡이 좌/우 칸의 작대기 개수와 "
+                            "가로·세로의 쉼표 소수점을 이 확대본으로 다시 대조하세요."})
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{_encode_sp_table_crop(str(p))}",
+                              "detail": "high"},
+            })
         if client_hint == "JO":
             content.append({"type": "text", "text": "제이원 품목표 확대본입니다. 수량/손잡이 좌/우 숫자를 행별로 다시 대조하세요."})
             content.append({
@@ -677,12 +825,11 @@ def extract_order(image_paths, client_hint=None, ship_date=None, model=None):
     last = None
     for attempt in range(MAX_RETRY):
         try:
-            resp = client.chat.completions.create(
+            resp = create_completion(
                 model=model or MODEL,
                 messages=[{"role": "system", "content": SYSTEM_PROMPT},
                           {"role": "user", "content": content}],
                 response_format=RESPONSE_FORMAT,
-                temperature=0,
             )
             data = json.loads(resp.choices[0].message.content)
             # 사용자 선택이나 파일명으로 확정한 거래처는
@@ -837,6 +984,8 @@ def extract_order(image_paths, client_hint=None, ship_date=None, model=None):
                 if explicit_piece and "피스" not in common_parts:
                     common_parts.insert(0, "피스")
                 data["전체기재사항"] = "/".join(common_parts) or None
+            if client_hint == "SP":
+                _fix_sp_order_no(data)
             # 배송은 모델의 추측값을 그대로 쓰지 않는다. 업체 기본값을 우선하고,
             # 발주서 원문에 택배/화물/내사/배달 등이 명시된 경우에만 예외로 덮어쓴다.
             # 특히 "내일 출고", "빠른 출고"만으로는 배송 방식이 바뀌지 않는다.
@@ -860,7 +1009,13 @@ def extract_order(image_paths, client_hint=None, ship_date=None, model=None):
                 else:
                     time.sleep(1.5 * (attempt + 1))
     hint = diagnose()
-    raise RuntimeError(hint or f"분석에 실패했습니다.\n({type(last).__name__})")
+    # 실제 오류 문구까지 보여 준다. 예전에는 오류 종류만 나와서
+    # "분석에 실패했습니다 (BadRequestError)" 만 뜨고 원인을 알 수 없었다.
+    detail = re.sub(r"\s+", " ", str(last)).strip()[:300] if last else ""
+    if hint:
+        raise RuntimeError(f"{hint}\n\n(원인: {detail})" if detail else hint)
+    raise RuntimeError(
+        f"분석에 실패했습니다.\n({type(last).__name__}) {detail}".rstrip())
 
 
 # ─────────────────────────────────────────────

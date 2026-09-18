@@ -423,8 +423,10 @@ def ingest_file(path: str | Path, client_hint: str | None = None,
         from extract import extract_pdf
         got = extract_pdf(path, client_hint=hint)
     elif suffix in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
-        from extract import extract_order
-        got = [extract_order([path], client_hint=hint)]
+        from extract import extract_order, prepare_sp_image
+        # 스페이스 작업일지 사진은 PDF와 같은 보정을 거친다(눕힌 사진 세우기·대비).
+        source = prepare_sp_image(path) if hint == "SP" else path
+        got = [extract_order([source], client_hint=hint)]
     else:
         raise ValueError(f"지원하지 않는 파일 형식입니다: {suffix or path.name}")
 
@@ -635,6 +637,34 @@ def build_output_rows(orders: list[dict], ship: date, M: Master | None = None,
             row["_output_index"] = len(rows)
             rows.append(row)
     return rows
+
+
+def merge_sp_page_orders(orders: list[dict]) -> list[dict]:
+    """스페이스 작업일지 여러 장을 주문번호 기준으로 합친다(2026-09-18).
+
+    PDF는 쪽마다 판독한 뒤 합치지만, 사진은 파일 하나가 주문 하나로 들어온다.
+    한 주문이 두 장에 걸쳐 있으면 주문번호가 같으므로 한 건으로 합친다.
+    번호를 못 읽은 장은 합치지 않고 그대로 둔다.
+    """
+    from extract import _merge_sp_orders, _sp_order_key
+    mergeable = [o for o in orders
+                 if o.get("거래처") == "SP" and _sp_order_key(o.get("주문번호"))]
+    if len(mergeable) < 2:
+        return orders
+    merged_by_key = {_sp_order_key(m.get("주문번호")): m
+                     for m in _merge_sp_orders([dict(o) for o in mergeable])}
+    mergeable_ids = {id(o) for o in mergeable}
+    out, seen = [], set()
+    for order in orders:
+        if id(order) not in mergeable_ids:
+            out.append(order)
+            continue
+        key = _sp_order_key(order.get("주문번호"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(merged_by_key.get(key, order))
+    return out
 
 
 def count_windows(orders: list[dict]) -> int:

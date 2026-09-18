@@ -81,6 +81,7 @@ from desktop_workflow import (
     editable_columns_for_row,
     generate_outputs,
     ingest_file,
+    merge_sp_page_orders,
     ledger_orders_for_precheck,
     preview_statuses,
     resolve_stable_merge_specs,
@@ -466,6 +467,8 @@ class ImportWorker(QThread):
                 succeeded.append(str(path))
             except Exception as exc:
                 errors.append(f"{path.name}: {type(exc).__name__} - {exc}")
+        # 스페이스 작업일지 사진 여러 장은 주문번호가 같으면 한 주문으로 합친다.
+        orders = merge_sp_page_orders(orders)
         self.completed.emit(orders, errors, succeeded)
 
 

@@ -627,9 +627,27 @@ def _split_integer_windows(order):
             else:
                 out.append(it)
             continue
-        if handle_split(it.get("수량")):
-            out.append(it)
-            continue
+        split_n = handle_split(it.get("수량"))
+        if split_n:
+            if order.get("거래처") == "SP":
+                # 스페이스 수량 `1/2`는 손잡이 분할이 아니라 **가로를 2등분**한다는 뜻이다.
+                # 가로 200 · 1/2 -> 가로 100짜리 2창. 청구도 나눈 창 각각 계산한다(2026-09-18).
+                width = _as_float(it.get("가로"))
+                if width:
+                    part = width / split_n
+                    it["가로"] = int(part) if float(part).is_integer() else round(part, 1)
+                it["수량"] = None
+                def _sn(v):
+                    try:
+                        return max(0, int(float(v))) if v not in (None, "") else 0
+                    except (TypeError, ValueError):
+                        return 0
+                if _sn(it.get("좌개수")) + _sn(it.get("우개수")) != split_n:
+                    it["창개수"] = split_n
+                # 아래 공통 로직이 창개수/좌우 기준으로 실제 창을 펼친다.
+            else:
+                out.append(it)
+                continue
         def _n(v):
             try:
                 return max(0, int(float(v))) if v not in (None, "") else 0
@@ -1057,8 +1075,9 @@ def to_rows(order, ship_label, M=None, sort_di=True):
     mark = "(K)" if is_roll_order else CLIENT_INFO.get(client, (None, None, None, ""))[3]
     order_no = str(order.get("주문번호") or "").strip()
     if client == "SP" and order_no:
+        # 스페이스 장부 상호 칸은 주문번호 끝 숫자를 괄호로 묶어 적는다(`C-9` -> `(9)`).
         m = re.search(r"(?:^|-)\s*(\d+)\s*$", order_no)
-        mark = m.group(1) if m else ""
+        mark = f"({m.group(1)})" if m else ""
     elif client in {"JL", "DU"} and order_no:
         # JL/두창은 주문번호를 반드시 괄호 포함으로 장부에 표시한다.
         mark = _jl_order_mark(order_no)
@@ -2967,6 +2986,32 @@ def build_erp(orders, M, path, order_date=None):
                 for part in ordered_tail:
                     if part not in extra_parts:
                         extra_parts.append(part)
+            elif client == "SP":
+                # 스페이스 적요 순서(2026-09-18 사용자 확정):
+                # 피스 -> 주문번호 -> 줄길이 -> 창별 세부 기재사항 -> 공통 기재사항
+                # 예) 피스/3-17/작은방/우미린아파트
+                # 장부 기재사항1(공통)·2(세부)를 기준으로 만들어 발주서/장부 어느 쪽에서 와도 같게 한다.
+                sp_order_no = str(o.get("주문번호") or "").strip()
+                if has_final_notes:
+                    common_parts = _split_note_parts(ledger_notes[0] if ledger_notes else None)
+                    detail_parts = _split_note_parts(ledger_notes[1] if len(ledger_notes) > 1 else None)
+                else:
+                    common_parts = _split_note_parts(order_common_note, o.get("고객명"))
+                    detail_parts = _split_note_parts(it.get("설치장소"), it.get("기재사항"))
+                detail_parts = _split_note_parts(it.get("_수동특이")) + detail_parts
+                if any("피스" in x for x in common_parts + detail_parts):
+                    extra_parts.append("피스")
+                if sp_order_no:
+                    extra_parts.append(sp_order_no)
+                handle_text = _erp_ledger_handle(it)      # 기본 길이가 아닌 줄길이
+                if handle_text:
+                    extra_parts.append(handle_text)
+                if _has_non_di_mix(it, client):
+                    extra_parts.append("MIX")
+                for part in detail_parts + common_parts:
+                    if "피스" in part or part == sp_order_no or part in extra_parts:
+                        continue
+                    extra_parts.append(part)
             elif client == "JL":
                 common = str(o.get("전체기재사항") or "")
                 receiver = _jl_customer_name(o.get("고객명") or delivery.get("수령인") or "")
@@ -3010,7 +3055,7 @@ def build_erp(orders, M, path, order_date=None):
                 extra_parts.extend(tail_parts)
             # 장부의 최종 기재사항이 존재하면 오래된 원본 전체기재/설치장소를 다시 조합하지 않는다.
             # 제작에 필요한 특이/MIX/손잡이 정보만 보존하고 기재사항 부분은 ledger_tail로 교체한다.
-            if has_final_notes and client not in BONO_STYLE_CLIENTS:
+            if has_final_notes and client != "SP" and client not in BONO_STYLE_CLIENTS:
                 production_parts = []
                 if client == "DI":
                     if it.get("_manual_special_override"):
@@ -3608,6 +3653,13 @@ def read_ledger(source, M=None, filename=None):
                 client = _ledger_client(client_cell)
                 marker_only = False
                 marker_order_no = None
+                if client in {"SP", "JL"}:
+                    # 상호 칸은 `SP   9`, `JL   (17-9)`처럼 거래처명과 주문번호 표시가 함께 있다.
+                    # 거래처명을 알아봤더라도 뒤의 번호를 주문번호 후보로 살린다.
+                    tail = re.sub(rf"^{re.escape(client)}", "", raw_client_mark).strip()
+                    tail = re.sub(r"^[（(]\s*|\s*[）)]$", "", tail).strip()
+                    if tail and tail.upper() != "K" and re.fullmatch(r"[A-Za-z0-9-]+", tail):
+                        marker_order_no = tail
                 if not client and current is not None:
                     # 같은 업체를 연속 작성할 때 상호 대신 (K)/(F) 같은 내부표시만
                     # 쓰거나, SP/JL은 주문번호만 쓰는 장부를 다시 읽을 수 있게 한다.
@@ -3615,7 +3667,8 @@ def read_ledger(source, M=None, filename=None):
                     if paren_mark:
                         client = current.get("거래처")
                         marker_only = True
-                        if current.get("거래처") == "JL" and paren_mark.group(1).upper() != "K":
+                        # JL `(17-9)`, SP `(9)`처럼 괄호 안 숫자는 주문번호 표시다.
+                        if current.get("거래처") in {"JL", "SP"} and paren_mark.group(1).upper() != "K":
                             marker_order_no = paren_mark.group(1)
                     elif current.get("거래처") in {"SP", "JL"} and \
                             re.fullmatch(r"[A-Za-z0-9-]+", raw_client_mark):
@@ -3813,8 +3866,13 @@ def read_ledger(source, M=None, filename=None):
                 notices = [p for p in sp_parts if "공지" in p]
                 if notices:
                     # 공지는 장부 첫 행에만 1회 적히므로 주문 공통값으로 되돌린다(EDI는 모든 창에 적용).
-                    current["전체기재사항"] = "/".join(_split_note_parts(current.get("전체기재사항"), *notices))
-                    note1 = "/".join(p for p in sp_parts if "공지" not in p) or None
+                    current["전체기재사항"] = "/".join(
+                        _split_note_parts(current.get("전체기재사항"), *notices))
+                # 기재사항1은 발주번호 + 공통기재사항이다. 발주번호·공지를 뺀 나머지는
+                # 아래 _restore_sp_ledger_notes 에서 공통/창별로 나눈다(2026-09-18).
+                order_no_now = str(current.get("주문번호") or "")
+                note1 = "/".join(p for p in sp_parts
+                                 if "공지" not in p and p != order_no_now) or None
             if raw_color:
                 prev_color = raw_color
             code, kind, type_ = parse_ledger_color(color_text, note1)
@@ -3860,6 +3918,8 @@ def read_ledger(source, M=None, filename=None):
                          "기재사항2": note2, "출고일": None,
                          "_같은색": color_cell in (None, ""), "_특수": None})
     for _order in orders:
+        if _order.get("거래처") == "SP":
+            _restore_sp_ledger_notes(_order)
         if _order.get("거래처") == "JL":
             _restore_jl_ledger_notes(_order)
         elif _order.get("거래처") == "DU":
@@ -3910,6 +3970,25 @@ def _restore_du_ledger_customer(order):
     order["고객명"] = first
     for it, parts in zip(items, part_lists):
         it["기재사항"] = "/".join(p for p in parts if p != first) or None
+
+
+def _restore_sp_ledger_notes(order):
+    """SP 장부 기재사항1을 공통/창별로 나눈다(2026-09-18).
+
+    기재사항1은 원래 `발주번호 + 공통기재사항`이지만, 공통이 하나도 없는 주문에서는
+    창별 메모가 기재사항1로 올라온다. 모든 창에 같은 값만 공통으로 되돌리고
+    창마다 다른 값은 그 창의 메모로 남긴다.
+    """
+    items = [it for it in order.get("items") or [] if not it.get("예외품목")]
+    if not items:
+        return
+    part_lists = [_split_note_parts(it.get("기재사항")) for it in items]
+    shared = [p for p in part_lists[0] if all(p in parts for parts in part_lists[1:])]
+    if shared:
+        order["전체기재사항"] = "/".join(
+            _split_note_parts(order.get("전체기재사항"), *shared))
+    for it, parts in zip(items, part_lists):
+        it["기재사항"] = "/".join(p for p in parts if p not in shared) or None
 
 
 def _restore_jl_ledger_notes(order):

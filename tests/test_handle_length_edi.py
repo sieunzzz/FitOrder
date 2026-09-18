@@ -47,7 +47,12 @@ def _via_ledger(orders, tmp_path):
 def test_non_default_handle_in_edi_for_every_client(tmp_path, client):
     orders = [_order(client, 120)]                       # 투코드 세로 150 기본값은 100
     direct = _memos(copy.deepcopy(orders), tmp_path / "a.xls")
-    assert direct and all(m.split(" ", 1)[1].startswith("손120") for m in direct)
+    assert direct
+    if client == "SP":
+        # 스페이스는 `피스/주문번호` 다음에 줄길이가 온다(업체 고유 순서).
+        assert all("손120" in m for m in direct)
+    else:
+        assert all(m.split(" ", 1)[1].startswith("손120") for m in direct)
     assert _via_ledger(orders, tmp_path) == direct       # 장부로 불러와도 같다
 
 
